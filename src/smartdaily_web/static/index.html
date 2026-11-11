@@ -639,6 +639,14 @@
       }
     }
 
+    async function clearAppBadgeIfSupported() {
+      if ("clearAppBadge" in navigator) {
+        try {
+          await navigator.clearAppBadge();
+        } catch (_) {}
+      }
+    }
+
     async function sendTestPush() {
       try {
         const res = await fetch("/api/push/test", { method: "POST" });
@@ -655,13 +663,23 @@
 
     // Event bindings
     document.querySelectorAll(".tab-btn").forEach((btn) => {
-      btn.addEventListener("click", () => loadTabContent(btn.dataset.tab));
+      btn.addEventListener("click", () => {
+        clearAppBadgeIfSupported();
+        loadTabContent(btn.dataset.tab);
+      });
     });
     document.getElementById("refreshBtn").addEventListener("click", () => {
+      clearAppBadgeIfSupported();
       loadStatus();
       loadTabContent(currentTab);
       showToast("🔄 已重新載入最新資料");
     });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        clearAppBadgeIfSupported();
+      }
+    });
+    window.addEventListener("focus", clearAppBadgeIfSupported);
     document.getElementById("togglePushPanelBtn").addEventListener("click", () => {
       document.getElementById("pushBanner").classList.toggle("visible");
     });
@@ -684,6 +702,7 @@
 
     // Boot
     window.addEventListener("DOMContentLoaded", async () => {
+      await clearAppBadgeIfSupported();
       await initServiceWorker();
       await loadStatus();
       const params = new URLSearchParams(window.location.search);
