@@ -6,6 +6,7 @@ import html
 import logging
 import os
 import re
+import time
 from typing import Any
 
 import httpx
@@ -54,6 +55,7 @@ class SmartdailyClient:
         self._explicit_device_id = (device_id or "").strip()
         self._explicit_com_id = (com_id or "").strip()
         self._raw_token: str = ""
+        self._token_expires_mono: float = 0.0
         self._com_id: str = self._explicit_com_id
         self._community_name: str = ""
 
@@ -67,22 +69,32 @@ class SmartdailyClient:
         raise ValueError("找不到 DeviceID！請設定環境變數 DEVICE_ID。")
 
     async def refresh_token(self) -> str:
-        """Fetch a fresh raw token from Valid/getHashCodeV2."""
+        """Fetch a fresh raw token via APK endpoint POST /v3/Valid/CommunityUserAccessToken."""
         device_id = self.resolve_device_id()
         async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(
-                f"{SMARTDAILY_API_BASE}/Valid/getHashCodeV2",
-                params={"code": device_id},
-                headers={"Accept": "application/json, text/plain, */*"},
+            resp = await client.post(
+                f"{SMARTDAILY_API_BASE}/v3/Valid/CommunityUserAccessToken",
+                json={"DeviceCode": device_id},
+                headers={
+                    "Accept": "application/json, text/plain, */*",
+                    "x-app-version": APP_VERSION,
+                    "User-Agent": DEFAULT_USER_AGENT,
+                },
             )
             resp.raise_for_status()
-            data = resp.json()
-            self._raw_token = data["Data"]["token"]
+            data = resp.json().get("Data") or {}
+            token = data.get("Token") or data.get("token")
+            if not token:
+                raise RuntimeError("無法取得智生活 AccessToken，請確認 DEVICE_ID 是否正確")
+            self._raw_token = str(token)
+            # Token validity is 10 minutes; refresh proactively after 9 minutes
+            self._token_expires_mono = time.monotonic() + 540.0
+            logger.debug("Refreshed CommunityUserAccessToken (ExpiredAt=%s)", data.get("ExpiredAt"))
             return self._raw_token
 
     async def ensure_context(self) -> tuple[str, str, str]:
-        """Ensure raw_token, com_id, and community_name are populated."""
-        if not self._raw_token:
+        """Ensure raw_token (unexpired), com_id, and community_name are populated."""
+        if not self._raw_token or time.monotonic() >= self._token_expires_mono:
             await self.refresh_token()
 
         if not self._com_id or not self._community_name:
