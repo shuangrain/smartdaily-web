@@ -19,13 +19,17 @@ from pydantic import BaseModel
 from .push_service import PushService
 from .smartdaily_client import SmartdailyClient
 
+LOG_LEVEL_STR = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+LOG_LEVEL = getattr(logging, LOG_LEVEL_STR, logging.INFO)
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("smartdaily_web")
+logger.setLevel(LOG_LEVEL)
 
 STATIC_DIR = Path(__file__).parent / "static"
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "180"))
@@ -47,12 +51,20 @@ async def poll_once() -> dict[str, Any]:
             client.get_announcements(offset=0, max_count=10),
             client.get_personal_notifications(offset=0, max_count=10),
         )
+        ann_items = ann_data.get("items", [])
+        personal_items = personal_data.get("items", [])
+        logger.debug(
+            "Polled %d announcements, %d personal notifications",
+            len(ann_items),
+            len(personal_items),
+        )
         events = push_service.check_and_record_new_items(
-            announcements=ann_data.get("items", []),
-            personal_notifications=personal_data.get("items", []),
+            announcements=ann_items,
+            personal_notifications=personal_items,
         )
         pushed_count = 0
         for ev in events:
+            logger.info("New %s detected (%s): %s", ev["type"], ev["id"], ev["title"])
             res = push_service.send_push_to_all(
                 title=ev["title"],
                 body=ev["body"],
@@ -253,7 +265,13 @@ if STATIC_DIR.is_dir():
 def main() -> None:
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("smartdaily_web.main:app", host=host, port=port, reload=False)
+    uvicorn.run(
+        "smartdaily_web.main:app",
+        host=host,
+        port=port,
+        log_level=LOG_LEVEL_STR.lower(),
+        reload=False,
+    )
 
 
 if __name__ == "__main__":

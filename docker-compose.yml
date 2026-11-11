@@ -9,6 +9,7 @@ services:
       - DEVICE_ID=${DEVICE_ID:-}
       - COM_ID=${COM_ID:-}
       - POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS:-180}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - VAPID_SUBJECT=${VAPID_SUBJECT:-mailto:admin@example.com}
       - DATA_DIR=/app/data
     volumes:

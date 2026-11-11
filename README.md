@@ -48,6 +48,7 @@ services:
     environment:
       - DEVICE_ID=您的DeviceID
       - POLL_INTERVAL_SECONDS=180
+      - LOG_LEVEL=INFO
     volumes:
       - ./data:/app/data
 ```
