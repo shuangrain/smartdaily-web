@@ -1,0 +1,15 @@
+services:
+  smartdaily-web:
+    image: ghcr.io/shuangrain/smartdaily-web:latest
+    container_name: smartdaily-web
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - DEVICE_ID=${DEVICE_ID:-}
+      - COM_ID=${COM_ID:-}
+      - POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS:-180}
+      - VAPID_SUBJECT=${VAPID_SUBJECT:-mailto:admin@example.com}
+      - DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data

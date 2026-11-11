@@ -1,0 +1,35 @@
+[project]
+name = "smartdaily-web"
+version = "0.1.0"
+description = "智生活社區公告與個人通知 Web (PWA) 與 Web Push 推播服務"
+readme = "README.md"
+authors = [
+    { name = "lex.xu", email = "shuangrain07@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.162.4",
+    "httpx>=0.28.1",
+    "pywebpush>=2.5.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+smartdaily-web = "smartdaily_web:main"
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.4",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

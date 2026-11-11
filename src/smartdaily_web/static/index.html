@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>社區公告與個人通知</title>
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#2563eb" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="社區通知" />
+  <link rel="apple-touch-icon" href="/static/icon@2x.png" />
+  <link rel="icon" type="image/png" href="/static/icon.png" />
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --card-hover: #26354d;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --primary: #3b82f6;
+      --primary-dark: #2563eb;
+      --accent: #10b981;
+      --warn: #f59e0b;
+      --danger: #ef4444;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body {
+      margin: 0;
+      padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom) 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(15, 23, 42, 0.92);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 16px 0 16px;
+    }
+    .header-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .brand img {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+    }
+    .brand-title {
+      font-size: 1.1rem;
+      font-weight: 700;
+    }
+    .brand-sub {
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    .header-actions {
+      display: flex;
+      gap: 8px;
+    }
+    .btn {
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--text);
+      padding: 7px 12px;
+      border-radius: 9px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+    }
+    .btn:hover { background: var(--card-hover); }
+    .btn-primary {
+      background: var(--primary-dark);
+      border-color: var(--primary);
+    }
+    .btn-primary:hover { background: var(--primary); }
+    .btn-accent {
+      background: #059669;
+      border-color: var(--accent);
+    }
+    .btn-danger {
+      background: #dc2626;
+      border-color: var(--danger);
+    }
+    .tabs {
+      display: flex;
+      gap: 4px;
+    }
+    .tab-btn {
+      flex: 1;
+      text-align: center;
+      padding: 10px 6px;
+      font-size: 0.92rem;
+      font-weight: 600;
+      color: var(--muted);
+      background: transparent;
+      border: none;
+      border-bottom: 3px solid transparent;
+      cursor: pointer;
+    }
+    .tab-btn.active {
+      color: var(--primary);
+      border-bottom-color: var(--primary);
+    }
+    main {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 14px 16px 80px 16px;
+    }
+    .push-banner {
+      background: linear-gradient(135deg, #1e3a8a, #1e293b);
+      border: 1px solid #3b82f655;
+      border-radius: 12px;
+      padding: 14px;
+      margin-bottom: 16px;
+      display: none;
+    }
+    .push-banner.visible { display: block; }
+    .push-banner h3 {
+      margin: 0 0 6px 0;
+      font-size: 0.98rem;
+    }
+    .push-banner p {
+      margin: 0 0 10px 0;
+      font-size: 0.84rem;
+      color: #cbd5e1;
+    }
+    .push-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .card-list {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+      cursor: pointer;
+      transition: transform 0.12s, background 0.15s;
+    }
+    .card:hover { background: var(--card-hover); }
+    .card-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .badge {
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 0.72rem;
+      font-weight: 700;
+    }
+    .badge-top { background: #f59e0b22; color: #fbbf24; border: 1px solid #f59e0b66; }
+    .badge-type { background: #3b82f622; color: #60a5fa; border: 1px solid #3b82f655; }
+    .badge-unread { background: #ef444422; color: #f87171; border: 1px solid #ef444466; }
+    .card-title {
+      font-size: 1rem;
+      font-weight: 700;
+      margin: 0 0 6px 0;
+      color: var(--text);
+    }
+    .card-preview {
+      font-size: 0.88rem;
+      color: #cbd5e1;
+      margin: 0;
+      white-space: pre-line;
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .card-preview.expanded {
+      display: block;
+      -webkit-line-clamp: unset;
+    }
+    .notif-images {
+      margin-top: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .notif-images img {
+      max-width: 100%;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+    /* Modal for Announcement Detail & Attachments */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.72);
+      z-index: 50;
+      display: none;
+      align-items: flex-end;
+      justify-content: center;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      background: var(--card);
+      width: 100%;
+      max-width: 760px;
+      max-height: 88vh;
+      border-radius: 18px 18px 0 0;
+      border-top: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .modal-header {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+    }
+    .modal-header h2 {
+      margin: 0;
+      font-size: 1.05rem;
+      line-height: 1.4;
+    }
+    .modal-body {
+      padding: 16px;
+      overflow-y: auto;
+      white-space: pre-line;
+      font-size: 0.93rem;
+      color: #e2e8f0;
+    }
+    .attachments-box {
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+    .attachments-box h4 {
+      margin: 0 0 10px 0;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+    .attachment-item {
+      margin-bottom: 12px;
+    }
+    .attachment-item img {
+      max-width: 100%;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      display: block;
+      margin-top: 6px;
+    }
+    .empty-state {
+      text-align: center;
+      padding: 48px 16px;
+      color: var(--muted);
+    }
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #0f172aee;
+      border: 1px solid var(--primary);
+      color: var(--text);
+      padding: 10px 16px;
+      border-radius: 10px;
+      font-size: 0.86rem;
+      z-index: 100;
+      display: none;
+    }
+    .toast.show { display: block; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-top">
+      <div class="brand">
+        <img src="/static/icon.png" alt="Logo" />
+        <div>
+          <div class="brand-title" id="communityName">載入社區中...</div>
+          <div class="brand-sub" id="statusSub">智生活社區公告與個人通知</div>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button class="btn" id="togglePushPanelBtn" title="推播通知設定">🔔 推播</button>
+        <button class="btn" id="refreshBtn" title="重新整理">🔄 更新</button>
+      </div>
+    </div>
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="announcements">📢 社區公告</button>
+      <button class="tab-btn" data-tab="personal">🔔 個人通知</button>
+      <button class="tab-btn" data-tab="reminders">📬 我的提醒</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="push-banner" id="pushBanner">
+      <h3>📱 iOS / 瀏覽器 Web Push 推播設定</h3>
+      <p id="pushHint">
+        若使用 iPhone / iPad (iOS 16.4+)，請先點選 Safari 底部的「分享 ➔ 加入主畫面」，並從主畫面開啟本程式後點擊下方按鈕啟用通知。
+      </p>
+      <div class="push-actions">
+        <button class="btn btn-primary" id="enablePushBtn">🔔 開啟推播通知</button>
+        <button class="btn btn-danger" id="disablePushBtn" style="display:none;">🔕 取消推播通知</button>
+        <button class="btn btn-accent" id="testPushBtn">📨 發送測試推播</button>
+        <button class="btn" id="pollNowBtn">⚡ 立即檢查新訊息</button>
+      </div>
+    </section>
+
+    <div id="contentArea" class="card-list">
+      <div class="empty-state">載入資料中...</div>
+    </div>
+  </main>
+
+  <div class="modal-backdrop" id="detailModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div>
+          <div class="card-meta" id="modalMeta"></div>
+          <h2 id="modalTitle">公告詳情</h2>
+        </div>
+        <button class="btn" id="closeModalBtn">✕ 關閉</button>
+      </div>
+      <div class="modal-body">
+        <div id="modalContent"></div>
+        <div class="attachments-box" id="modalAttachments" style="display:none;"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let currentTab = "announcements";
+    let swRegistration = null;
+
+    function showToast(msg) {
+      const t = document.getElementById("toast");
+      t.textContent = msg;
+      t.classList.add("show");
+      setTimeout(() => t.classList.remove("show"), 3200);
+    }
+
+    function urlBase64ToUint8Array(base64String) {
+      const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+      const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+      const rawData = window.atob(base64);
+      const outputArray = new Uint8Array(rawData.length);
+      for (let i = 0; i < rawData.length; ++i) {
+        outputArray[i] = rawData.charCodeAt(i);
+      }
+      return outputArray;
+    }
+
+    async function loadStatus() {
+      try {
+        const res = await fetch("/api/status");
+        const data = await res.json();
+        document.getElementById("communityName").textContent = data.community_name || "社區通知";
+        document.getElementById("statusSub").textContent =
+          `已濾除平台廣告 ｜ 推播訂閱裝置：${data.subscribers_count} 台`;
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    async function loadTabContent(tab) {
+      currentTab = tab;
+      document.querySelectorAll(".tab-btn").forEach((b) => {
+        b.classList.toggle("active", b.dataset.tab === tab);
+      });
+      const container = document.getElementById("contentArea");
+      container.innerHTML = `<div class="empty-state">載入中...</div>`;
+
+      try {
+        if (tab === "announcements") {
+          const res = await fetch("/api/announcements");
+          const data = await res.json();
+          renderAnnouncements(data.items || []);
+        } else if (tab === "personal") {
+          const res = await fetch("/api/notifications/personal");
+          const data = await res.json();
+          renderPersonalNotifications(data.items || []);
+        } else if (tab === "reminders") {
+          const res = await fetch("/api/notifications/reminders");
+          const data = await res.json();
+          renderReminders(data.items || []);
+        }
+      } catch (err) {
+        container.innerHTML = `<div class="empty-state">載入失敗：${err.message}</div>`;
+      }
+    }
+
+    function renderAnnouncements(items) {
+      const container = document.getElementById("contentArea");
+      if (!items.length) {
+        container.innerHTML = `<div class="empty-state">目前沒有社區公告</div>`;
+        return;
+      }
+      container.innerHTML = "";
+      items.forEach((ann) => {
+        const card = document.createElement("div");
+        card.className = "card";
+        const topBadge = ann.is_top ? `<span class="badge badge-top">📌 置頂</span>` : "";
+        const typeBadge = `<span class="badge badge-type">${ann.type_name || "公告"}</span>`;
+        const preview = ann.content || "（點擊查看附件或詳細內容）";
+        card.innerHTML = `
+          <div class="card-meta">
+            ${topBadge}
+            ${typeBadge}
+            <span>📅 ${ann.start_date ? ann.start_date.slice(0, 10) : ann.create_date}</span>
+          </div>
+          <h3 class="card-title">${ann.title}</h3>
+          <p class="card-preview">${preview}</p>
+        `;
+        card.addEventListener("click", () => openAnnouncementDetail(ann.id, ann));
+        container.appendChild(card);
+      });
+    }
+
+    async function openAnnouncementDetail(id, fallbackAnn) {
+      const modal = document.getElementById("detailModal");
+      const titleEl = document.getElementById("modalTitle");
+      const metaEl = document.getElementById("modalMeta");
+      const contentEl = document.getElementById("modalContent");
+      const attachBox = document.getElementById("modalAttachments");
+
+      titleEl.textContent = fallbackAnn ? fallbackAnn.title : "載入中...";
+      metaEl.textContent = fallbackAnn ? `發布時間：${fallbackAnn.create_date || fallbackAnn.start_date}` : "";
+      contentEl.textContent = "正在載入最新內容與有效附件連結...";
+      attachBox.style.display = "none";
+      attachBox.innerHTML = "";
+      modal.classList.add("open");
+
+      try {
+        const res = await fetch(`/api/announcements/${encodeURIComponent(id)}`);
+        const detail = await res.json();
+        titleEl.textContent = detail.title || fallbackAnn?.title || "";
+        metaEl.innerHTML = `<span class="badge badge-type">${detail.type_name || "公告"}</span> <span>📅 ${detail.create_date || fallbackAnn?.start_date || ""}</span>`;
+        contentEl.textContent = detail.content || fallbackAnn?.content || "（本公告無文字內文，請參閱下方附件）";
+
+        if (detail.attachments && detail.attachments.length > 0) {
+          attachBox.style.display = "block";
+          attachBox.innerHTML = `<h4>📎 公告附件（共 ${detail.attachments.length} 個，已即時刷新簽名連結）</h4>`;
+          detail.attachments.forEach((att) => {
+            const div = document.createElement("div");
+            div.className = "attachment-item";
+            if (att.type === "image") {
+              div.innerHTML = `
+                <a class="btn" href="${att.url}" target="_blank" rel="noopener">🖼️ 開啟原圖 (${att.filename})</a>
+                <img src="${att.url}" alt="${att.filename}" loading="lazy" />
+              `;
+            } else if (att.type === "pdf") {
+              div.innerHTML = `
+                <a class="btn btn-primary" href="${att.url}" target="_blank" rel="noopener">📄 開啟 PDF 文件 (${att.filename})</a>
+              `;
+            } else {
+              div.innerHTML = `
+                <a class="btn" href="${att.url}" target="_blank" rel="noopener">📎 下載附件 (${att.filename})</a>
+              `;
+            }
+            attachBox.appendChild(div);
+          });
+        }
+      } catch (err) {
+        contentEl.textContent = `載入詳情失敗：${err.message}`;
+      }
+    }
+
+    function renderPersonalNotifications(items) {
+      const container = document.getElementById("contentArea");
+      if (!items.length) {
+        container.innerHTML = `<div class="empty-state">目前沒有個人通知</div>`;
+        return;
+      }
+      container.innerHTML = "";
+      items.forEach((item) => {
+        const card = document.createElement("div");
+        card.className = "card";
+        let imagesHtml = "";
+        if (item.files && item.files.length > 0) {
+          imagesHtml = `<div class="notif-images">` +
+            item.files.map((f) => `<img src="${f.url}" alt="附件圖片" loading="lazy" />`).join("") +
+            `</div>`;
+        }
+        card.innerHTML = `
+          <div class="card-meta">
+            <span class="badge badge-type">物管推播</span>
+            <span>🕒 ${item.push_date}</span>
+          </div>
+          <p class="card-preview expanded">${item.content}</p>
+          ${imagesHtml}
+        `;
+        container.appendChild(card);
+      });
+    }
+
+    function renderReminders(items) {
+      const container = document.getElementById("contentArea");
+      if (!items.length) {
+        container.innerHTML = `<div class="empty-state">目前沒有提醒紀錄</div>`;
+        return;
+      }
+      container.innerHTML = "";
+      const featureLabels = {
+        postal: "📦 郵務包裹",
+        Col: "🔑 寄放物",
+        CommunityPushNotification: "🔔 個人通知",
+        Ann: "📢 社區公告",
+      };
+      items.forEach((item) => {
+        const card = document.createElement("div");
+        card.className = "card";
+        const tagLabel = featureLabels[item.feature_name] || item.feature_name || "提醒";
+        const unreadBadge = !item.has_read ? `<span class="badge badge-unread">未讀</span>` : "";
+        const localTime = item.pushing_time ? new Date(item.pushing_time).toLocaleString("zh-TW") : "";
+        card.innerHTML = `
+          <div class="card-meta">
+            ${unreadBadge}
+            <span class="badge badge-type">${tagLabel}</span>
+            <span>🕒 ${localTime}</span>
+          </div>
+          <h3 class="card-title">${item.title}</h3>
+          <p class="card-preview expanded">${item.body}</p>
+        `;
+        if (item.feature_name === "Ann" && item.target_id) {
+          card.addEventListener("click", () => openAnnouncementDetail(item.target_id, { title: item.body }));
+        }
+        container.appendChild(card);
+      });
+    }
+
+    async function initServiceWorker() {
+      if (!("serviceWorker" in navigator)) return;
+      try {
+        swRegistration = await navigator.serviceWorker.register("/sw.js");
+        await updatePushUIState();
+      } catch (e) {
+        console.warn("SW register failed:", e);
+      }
+    }
+
+    async function updatePushUIState() {
+      const enableBtn = document.getElementById("enablePushBtn");
+      const disableBtn = document.getElementById("disablePushBtn");
+      const toggleBtn = document.getElementById("togglePushPanelBtn");
+      if (!swRegistration || !("pushManager" in swRegistration)) return;
+      try {
+        const sub = await swRegistration.pushManager.getSubscription();
+        if (sub) {
+          enableBtn.style.display = "none";
+          disableBtn.style.display = "inline-flex";
+          toggleBtn.textContent = "🟢 推播已開";
+        } else {
+          enableBtn.style.display = "inline-flex";
+          disableBtn.style.display = "none";
+          toggleBtn.textContent = "🔔 推播";
+        }
+      } catch (e) {
+        console.warn("Failed to check subscription:", e);
+      }
+    }
+
+    async function subscribeWebPush() {
+      if (!("Notification" in window) || !("PushManager" in window)) {
+        showToast("⚠️ 目前瀏覽器環境尚未支援 Web Push（iOS 請先加入主畫面）");
+        return;
+      }
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        showToast("❌ 您未允許通知權限");
+        return;
+      }
+      try {
+        if (!swRegistration) {
+          swRegistration = await navigator.serviceWorker.ready;
+        }
+        const keyRes = await fetch("/api/push/vapid-public-key");
+        const { public_key } = await keyRes.json();
+        const sub = await swRegistration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(public_key),
+        });
+        await fetch("/api/push/subscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(sub.toJSON()),
+        });
+        showToast("✅ 已成功開啟 Web Push 推播通知！");
+        await updatePushUIState();
+        await loadStatus();
+      } catch (err) {
+        showToast("訂閱失敗：" + err.message);
+      }
+    }
+
+    async function unsubscribeWebPush() {
+      try {
+        if (!swRegistration) {
+          swRegistration = await navigator.serviceWorker.ready;
+        }
+        const sub = await swRegistration.pushManager.getSubscription();
+        if (sub) {
+          await fetch("/api/push/unsubscribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ endpoint: sub.endpoint }),
+          });
+          await sub.unsubscribe();
+        }
+        showToast("🔕 已取消本裝置的推播通知");
+        await updatePushUIState();
+        await loadStatus();
+      } catch (err) {
+        showToast("取消訂閱失敗：" + err.message);
+      }
+    }
+
+    async function sendTestPush() {
+      try {
+        const res = await fetch("/api/push/test", { method: "POST" });
+        const data = await res.json();
+        if (data.active_subscribers === 0) {
+          showToast("⚠️ 尚未有任何訂閱裝置，請先點擊「開啟推播通知」");
+        } else {
+          showToast(`📨 已發送測試推播至 ${data.sent} 台裝置！`);
+        }
+      } catch (e) {
+        showToast("發送失敗：" + e.message);
+      }
+    }
+
+    // Event bindings
+    document.querySelectorAll(".tab-btn").forEach((btn) => {
+      btn.addEventListener("click", () => loadTabContent(btn.dataset.tab));
+    });
+    document.getElementById("refreshBtn").addEventListener("click", () => {
+      loadStatus();
+      loadTabContent(currentTab);
+      showToast("🔄 已重新載入最新資料");
+    });
+    document.getElementById("togglePushPanelBtn").addEventListener("click", () => {
+      document.getElementById("pushBanner").classList.toggle("visible");
+    });
+    document.getElementById("enablePushBtn").addEventListener("click", subscribeWebPush);
+    document.getElementById("disablePushBtn").addEventListener("click", unsubscribeWebPush);
+    document.getElementById("testPushBtn").addEventListener("click", sendTestPush);
+    document.getElementById("pollNowBtn").addEventListener("click", async () => {
+      const res = await fetch("/api/poll-now", { method: "POST" });
+      const data = await res.json();
+      showToast(`⚡ 檢查完成，發現 ${data.new_events_count} 則新訊息`);
+    });
+    document.getElementById("closeModalBtn").addEventListener("click", () => {
+      document.getElementById("detailModal").classList.remove("open");
+    });
+    document.getElementById("detailModal").addEventListener("click", (e) => {
+      if (e.target.id === "detailModal") {
+        document.getElementById("detailModal").classList.remove("open");
+      }
+    });
+
+    // Boot
+    window.addEventListener("DOMContentLoaded", async () => {
+      await initServiceWorker();
+      await loadStatus();
+      const params = new URLSearchParams(window.location.search);
+      const tabParam = params.get("tab");
+      const idParam = params.get("id");
+      if (tabParam && ["announcements", "personal", "reminders"].includes(tabParam)) {
+        await loadTabContent(tabParam);
+      } else {
+        await loadTabContent("announcements");
+      }
+      if (idParam) {
+        openAnnouncementDetail(idParam, null);
+      }
+    });
+  </script>
+</body>
+</html>
