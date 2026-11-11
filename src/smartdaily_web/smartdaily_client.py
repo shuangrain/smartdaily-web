@@ -190,6 +190,9 @@ class SmartdailyClient:
         return {
             "community_name": community_name,
             "com_id": com_id,
+            "offset": offset,
+            "max_count": max_count,
+            "has_more": len(filtered) >= max_count,
             "total_count": len(items),
             "latest": latest_item,
             "items": items,
@@ -293,6 +296,9 @@ class SmartdailyClient:
         return {
             "community_name": community_name,
             "com_id": com_id,
+            "offset": offset,
+            "max_count": max_count,
+            "has_more": bool(payload.get("HasMoreData", len(items) >= max_count)),
             "total_count": len(items),
             "latest": items[0] if items else None,
             "items": items,
@@ -339,6 +345,8 @@ class SmartdailyClient:
             )
 
         return {
+            "has_more": len(items) >= 10,
+            "next_before_datetime": items[-1]["pushing_time"] if items else "",
             "total_count": len(items),
             "latest": items[0] if items else None,
             "items": items,

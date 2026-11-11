@@ -333,6 +333,9 @@
     <div id="contentArea" class="card-list">
       <div class="empty-state">載入資料中...</div>
     </div>
+    <div id="loadMoreWrap" style="text-align:center; margin-top:16px; display:none;">
+      <button class="btn" id="loadMoreBtn" style="width:100%; justify-content:center; padding:12px;">⬇️ 載入更多</button>
+    </div>
   </main>
 
   <div class="modal-backdrop" id="detailModal">
@@ -356,6 +359,10 @@
   <script>
     let currentTab = "announcements";
     let swRegistration = null;
+    let currentOffset = 0;
+    let nextBeforeDatetime = "";
+    let hasMoreData = false;
+    let isLoadingMore = false;
 
     function showToast(msg) {
       const t = document.getElementById("toast");
@@ -387,40 +394,75 @@
       }
     }
 
-    async function loadTabContent(tab) {
-      currentTab = tab;
-      document.querySelectorAll(".tab-btn").forEach((b) => {
-        b.classList.toggle("active", b.dataset.tab === tab);
-      });
-      const container = document.getElementById("contentArea");
-      container.innerHTML = `<div class="empty-state">載入中...</div>`;
+    function updateLoadMoreButton() {
+      const wrap = document.getElementById("loadMoreWrap");
+      const btn = document.getElementById("loadMoreBtn");
+      wrap.style.display = hasMoreData ? "block" : "none";
+      btn.disabled = isLoadingMore;
+      btn.textContent = isLoadingMore ? "⏳ 載入中..." : "⬇️ 載入更多";
+    }
+
+    async function loadTabContent(tab, append = false) {
+      if (!append) {
+        currentTab = tab;
+        currentOffset = 0;
+        nextBeforeDatetime = "";
+        hasMoreData = false;
+        document.querySelectorAll(".tab-btn").forEach((b) => {
+          b.classList.toggle("active", b.dataset.tab === tab);
+        });
+        document.getElementById("contentArea").innerHTML = `<div class="empty-state">載入中...</div>`;
+        updateLoadMoreButton();
+      } else {
+        isLoadingMore = true;
+        updateLoadMoreButton();
+      }
 
       try {
         if (tab === "announcements") {
-          const res = await fetch("/api/announcements");
+          const res = await fetch(`/api/announcements?offset=${currentOffset}&max_count=10`);
           const data = await res.json();
-          renderAnnouncements(data.items || []);
+          const items = data.items || [];
+          hasMoreData = Boolean(data.has_more);
+          currentOffset += 10;
+          renderAnnouncements(items, append);
         } else if (tab === "personal") {
-          const res = await fetch("/api/notifications/personal");
+          const res = await fetch(`/api/notifications/personal?offset=${currentOffset}&max_count=10`);
           const data = await res.json();
-          renderPersonalNotifications(data.items || []);
+          const items = data.items || [];
+          hasMoreData = Boolean(data.has_more);
+          currentOffset += 10;
+          renderPersonalNotifications(items, append);
         } else if (tab === "reminders") {
-          const res = await fetch("/api/notifications/reminders");
+          const q = nextBeforeDatetime ? `?before_datetime=${encodeURIComponent(nextBeforeDatetime)}` : "";
+          const res = await fetch(`/api/notifications/reminders${q}`);
           const data = await res.json();
-          renderReminders(data.items || []);
+          const items = data.items || [];
+          hasMoreData = Boolean(data.has_more);
+          nextBeforeDatetime = data.next_before_datetime || "";
+          renderReminders(items, append);
         }
       } catch (err) {
-        container.innerHTML = `<div class="empty-state">載入失敗：${err.message}</div>`;
+        if (!append) {
+          document.getElementById("contentArea").innerHTML = `<div class="empty-state">載入失敗：${err.message}</div>`;
+        } else {
+          showToast("載入更多失敗：" + err.message);
+        }
+      } finally {
+        isLoadingMore = false;
+        updateLoadMoreButton();
       }
     }
 
-    function renderAnnouncements(items) {
+    function renderAnnouncements(items, append = false) {
       const container = document.getElementById("contentArea");
-      if (!items.length) {
-        container.innerHTML = `<div class="empty-state">目前沒有社區公告</div>`;
-        return;
+      if (!append) {
+        if (!items.length) {
+          container.innerHTML = `<div class="empty-state">目前沒有社區公告</div>`;
+          return;
+        }
+        container.innerHTML = "";
       }
-      container.innerHTML = "";
       items.forEach((ann) => {
         const card = document.createElement("div");
         card.className = "card";
@@ -490,13 +532,15 @@
       }
     }
 
-    function renderPersonalNotifications(items) {
+    function renderPersonalNotifications(items, append = false) {
       const container = document.getElementById("contentArea");
-      if (!items.length) {
-        container.innerHTML = `<div class="empty-state">目前沒有個人通知</div>`;
-        return;
+      if (!append) {
+        if (!items.length) {
+          container.innerHTML = `<div class="empty-state">目前沒有個人通知</div>`;
+          return;
+        }
+        container.innerHTML = "";
       }
-      container.innerHTML = "";
       items.forEach((item) => {
         const card = document.createElement("div");
         card.className = "card";
@@ -518,13 +562,15 @@
       });
     }
 
-    function renderReminders(items) {
+    function renderReminders(items, append = false) {
       const container = document.getElementById("contentArea");
-      if (!items.length) {
-        container.innerHTML = `<div class="empty-state">目前沒有提醒紀錄</div>`;
-        return;
+      if (!append) {
+        if (!items.length) {
+          container.innerHTML = `<div class="empty-state">目前沒有提醒紀錄</div>`;
+          return;
+        }
+        container.innerHTML = "";
       }
-      container.innerHTML = "";
       const featureLabels = {
         postal: "📦 郵務包裹",
         Col: "🔑 寄放物",
@@ -686,6 +732,7 @@
     document.getElementById("enablePushBtn").addEventListener("click", subscribeWebPush);
     document.getElementById("disablePushBtn").addEventListener("click", unsubscribeWebPush);
     document.getElementById("testPushBtn").addEventListener("click", sendTestPush);
+    document.getElementById("loadMoreBtn").addEventListener("click", () => loadTabContent(currentTab, true));
     document.getElementById("pollNowBtn").addEventListener("click", async () => {
       const res = await fetch("/api/poll-now", { method: "POST" });
       const data = await res.json();
