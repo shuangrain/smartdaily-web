@@ -1,17 +1,16 @@
-# 智生活社區公告與個人通知 Web (`smartdaily-web`)
+# 智生活社區公告與我的提醒 Web (`smartdaily-web`)
 
 [![CI Checks](https://github.com/shuangrain/smartdaily-web/actions/workflows/ci.yml/badge.svg)](https://github.com/shuangrain/smartdaily-web/actions/workflows/ci.yml)
 [![GitHub Release](https://img.shields.io/github/v/release/shuangrain/smartdaily-web?color=blue)](https://github.com/shuangrain/smartdaily-web/releases)
 [![GHCR](https://img.shields.io/badge/GHCR-ghcr.io%2Fshuangrain%2Fsmartdaily--web-blue?logo=docker)](https://github.com/shuangrain/smartdaily-web/pkgs/container/smartdaily-web)
 
 支援 **iOS 16.4+ 主畫面 PWA Web Push 推播通知**與桌面瀏覽器的輕量級 Web 服務，整合：
-1. **📢 社區公告**：自動過濾 `ComId == ""` 的智生活平台團購廣告，並在點開公告時**即時刷新 15 分鐘效期的 PDF / 圖片附件簽名網址**。
-2. **🔔 個人通知**：串接 `/api/v3.51/Message/Notification/List`，顯示物管中心發送給住戶的即時推播（含圖片附件）。
-3. **📬 我的提醒**：串接 `https://notification.kingnetsmart.com.tw/api/NotificationBox/LoadNotices`，完整呈現郵務包裹、寄放物、個人通知與新公告提醒。
-4. **📲 Web Push 自動推播（依裝置獨立拆檔追蹤）**：背景定期輪詢最新社區公告、個人通知與我的提醒，將所有訊息統一記錄於 `data/messages.json`，並將每台訂閱裝置與其已推播狀態分別獨立儲存於 `data/devices/<device_id>.json`（搭配 Atomic Write 避免多裝置同時讀寫衝突），支援多裝置獨立推播、失敗重試與一鍵取消訂閱。
+1. **📢 社區公告**：自動過濾 `ComId == ""` 的智生活平台團購廣告，並在背景發現新公告時**自動將 PDF / 圖片附件下載備份至本地**（同時支援點開時即時刷新 15 分鐘簽名網址），即使公告事後被社區回收刪除（`🗑️ 已回收`）仍可完整檢視內文與附件。
+2. **📬 我的提醒（支援類型篩選）**：串接 `https://notification.kingnetsmart.com.tw/api/NotificationBox/LoadNotices`，完整涵蓋 `📦 郵務包裹`、`🔑 寄放物`、`📢 社區公告`、`🔔 個人通知`（含物管圖片附件）與 `📬 其他` 提醒，並提供網頁端分類篩選器。
+3. **📲 Web Push 自動推播（依裝置獨立拆檔追蹤）**：統一由涵蓋範圍最完整的「📬 我的提醒」觸發推播，並在推播標題自動加上 `[類型]` 前綴（例如 `[📦 郵務包裹] 包裹到件通知`、`[📢 社區公告] 新公告通知`）；所有訊息完整保存於 `data/messages.json`（含 `is_deleted` 回收標記），每台訂閱裝置與其已推播狀態分別獨立儲存於 `data/devices/<device_id>.json`（搭配 Atomic Write 避免多裝置同時讀寫衝突）。
 
 > [!WARNING]
-> **⚠️  免責聲明 (Disclaimer)**  
+> **⚠️ 免責聲明 (Disclaimer)**  
 > 本工具僅供個人技術測試、研究與教學交流使用，與「今網智生活（智生活科技股份有限公司）」無任何官方合作或關聯。  
 > 使用本工具進行任何 API 呼叫、自動化作業所衍生之任何帳號異常、資料外洩或法律責任，開發者與貢獻者概不負任何形式之責任。請使用者確保在獲得適當授權之環境下使用，並妥善保管您的 `DEVICE_ID`（等同於長期登入憑證）。
 
@@ -24,7 +23,6 @@ flowchart TD
     subgraph SmartDaily["智生活雲端服務"]
         API_Auth["Token 驗證 API (v3)"]
         API_Ann["社區公告與附件 API (v3.24 / v3.2)"]
-        API_Notif["個人通知 API (v3.51)"]
         API_Rem["我的提醒 API (LoadNotices)"]
     end
 
@@ -32,7 +30,7 @@ flowchart TD
         Client["SmartdailyClient (自動換發 10 分鐘 Token)"]
         Poller["背景定時輪巡 (poll_once)"]
         PushSvc["PushService (訊息比對 / 回收偵測 / Web Push)"]
-        WebUI["REST API 與 PWA 靜態前端"]
+        WebUI["REST API 與 PWA 靜態前端 (公告檢視 + 提醒分類篩選)"]
     end
 
     subgraph Storage["本地持久化儲存 (/app/data)"]
@@ -47,24 +45,23 @@ flowchart TD
         DeviceB["裝置 B (電腦 / iPad 瀏覽器)"]
     end
 
-    Poller -->|"定時抓取最新訊息與附件"| Client
+    Poller -->|"定時抓取最新公告、附件與提醒"| Client
     WebUI -->|"分頁查詢 / 讀取本地備份附件"| Client
     Client --> API_Auth
     Client --> API_Ann
-    Client --> API_Notif
     Client --> API_Rem
 
-    Poller -->|"同步新訊息與標記已回收訊息"| PushSvc
+    Poller -->|"同步訊息、備份公告附件、標記已回收"| PushSvc
     WebUI -->|"合併顯示已回收訊息 (is_deleted)"| PushSvc
     PushSvc <-->|"Atomic 讀寫"| MsgStore
     PushSvc <-->|"自動下載與讀取"| AttFiles
     PushSvc <-->|"依裝置獨立讀寫"| DevFiles
     PushSvc -->|"讀取金鑰"| Vapid
 
-    PushSvc -->|"Web Push (僅推播該裝置未收過的 UID)"| DeviceA
-    PushSvc -->|"Web Push (僅推播該裝置未收過的 UID)"| DeviceB
-    DeviceA <-->|"瀏覽 / 訂閱推播"| WebUI
-    DeviceB <-->|"瀏覽 / 訂閱推播"| WebUI
+    PushSvc -->|"Web Push ([類型] 標題前綴，依裝置獨立追蹤)"| DeviceA
+    PushSvc -->|"Web Push ([類型] 標題前綴，依裝置獨立追蹤)"| DeviceB
+    DeviceA <-->|"瀏覽 / 分類篩選 / 訂閱推播"| WebUI
+    DeviceB <-->|"瀏覽 / 分類篩選 / 訂閱推播"| WebUI
 ```
 
 ---

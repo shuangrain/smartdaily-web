@@ -43,17 +43,15 @@ def test_push_service_vapid_and_per_device_push_tracking(tmp_path: Path, monkeyp
     # First run: initializes central message store & marks baseline on Device A without pushing
     events1 = svc.sync_messages(
         announcements=[{"id": "100", "title": "舊公告", "content": "內容"}],
-        personal_notifications=[{"id": "200", "community": "測試社區", "content": "舊通知"}],
-        reminders=[{"id": "300", "title": "舊提醒", "body": "舊包裹"}],
+        reminders=[{"id": "300", "feature_name": "postal", "title": "舊提醒", "body": "舊包裹"}],
     )
     assert events1 == []
-    assert len(svc.get_messages()) == 3
+    assert len(svc.get_messages()) == 2
 
     subs_after_init = svc.get_subscriptions()
     assert len(subs_after_init) == 1
     assert set(subs_after_init[0]["pushed_message_uids"]) == {
         "announcement:100",
-        "personal:200",
         "reminder:300",
     }
 
@@ -67,29 +65,41 @@ def test_push_service_vapid_and_per_device_push_tracking(tmp_path: Path, monkeyp
     dev_b = next(s for s in subs_with_b if s["endpoint"] == sub_b["endpoint"])
     assert set(dev_b["pushed_message_uids"]) == {
         "announcement:100",
-        "personal:200",
         "reminder:300",
     }
 
-    # Second run: new announcement, new personal notification, & new reminder arrive
+    # Second run: new announcement & 2 new reminders arrive
+    # Announcements are stored for display/backup; reminders trigger Web Push with [類型] prefix
     events2 = svc.sync_messages(
         announcements=[
             {"id": "101", "title": "新公告", "content": "新內容"},
             {"id": "100", "title": "舊公告", "content": "內容"},
         ],
-        personal_notifications=[
-            {"id": "201", "community": "測試社區", "content": "新推播通知"},
-            {"id": "200", "community": "測試社區", "content": "舊通知"},
-        ],
         reminders=[
-            {"id": "301", "title": "包裹到件通知", "body": "您有一件包裹已送達管理室"},
-            {"id": "300", "title": "舊提醒", "body": "舊包裹"},
+            {
+                "id": "302",
+                "feature_name": "Ann",
+                "target_id": "101",
+                "title": "新公告通知",
+                "body": "新公告",
+            },
+            {
+                "id": "301",
+                "feature_name": "postal",
+                "title": "包裹到件通知",
+                "body": "您有一件包裹已送達管理室",
+            },
+            {"id": "300", "feature_name": "postal", "title": "舊提醒", "body": "舊包裹"},
         ],
     )
-    assert len(events2) == 3
-    assert len(svc.get_messages()) == 6
+    assert len(events2) == 2
+    assert events2[0]["title"] == "[📦 郵務包裹] 包裹到件通知"
+    assert events2[0]["url"] == "/?tab=reminders"
+    assert events2[1]["title"] == "[📢 社區公告] 新公告通知"
+    assert events2[1]["url"] == "/?tab=announcements&id=101"
+    assert len(svc.get_messages()) == 5
 
-    # Simulate Device A succeeding all 3 pushes, while Device B temporarily fails on reminder:301
+    # Simulate Device A succeeding both pushes, while Device B fails on reminder:301
     delivery_log: list[tuple[str, str]] = []
 
     def fake_send_single_push(sub, payload_dict):
@@ -101,14 +111,16 @@ def test_push_service_vapid_and_per_device_push_tracking(tmp_path: Path, monkeyp
 
     monkeypatch.setattr(svc, "_send_single_push", fake_send_single_push)
     res1 = svc.push_unpushed_messages()
-    assert res1["sent"] == 5
+    assert res1["sent"] == 3
     assert res1["failed"] == 1
 
     subs_state = svc.get_subscriptions()
     dev_a_state = next(s for s in subs_state if s["endpoint"] == sub_a["endpoint"])
     dev_b_state = next(s for s in subs_state if s["endpoint"] == sub_b["endpoint"])
     assert "reminder:301" in dev_a_state["pushed_message_uids"]
+    assert "reminder:302" in dev_a_state["pushed_message_uids"]
     assert "reminder:301" not in dev_b_state["pushed_message_uids"]
+    assert "reminder:302" in dev_b_state["pushed_message_uids"]
 
     # Next push cycle: Device A gets 0 pushes, Device B retries ONLY reminder:301 and succeeds
     delivery_log.clear()

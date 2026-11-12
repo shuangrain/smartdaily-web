@@ -18,6 +18,24 @@ from pywebpush import WebPushException, webpush
 
 logger = logging.getLogger(__name__)
 
+REMINDER_TYPE_LABELS: dict[str, str] = {
+    "postal": "📦 郵務包裹",
+    "Col": "🔑 寄放物",
+    "Ann": "📢 社區公告",
+    "CommunityPushNotification": "🔔 個人通知",
+    "Msg": "🔔 個人通知",
+    "Bill": "💳 帳單繳費",
+    "payment": "💳 帳單繳費",
+    "Gas": "🔥 瓦斯抄表",
+    "Res": "📅 公設預約",
+    "vote": "🗳️ 社區投票",
+    "feedback": "💬 意見反映",
+}
+
+
+def get_reminder_type_label(feature_name: str) -> str:
+    return REMINDER_TYPE_LABELS.get(str(feature_name or "").strip(), "📬 其他提醒")
+
 
 def _make_device_id(endpoint: str) -> str:
     return hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:12]
@@ -349,14 +367,23 @@ class PushService:
                 "item": item_copy,
             }
         if msg_type == "reminder":
-            rem_title = raw_item.get("title") or "新提醒通知"
+            feature = str(raw_item.get("feature_name") or "").strip()
+            type_label = get_reminder_type_label(feature)
+            rem_title = str(raw_item.get("title") or "").strip() or "新提醒通知"
+            target_id = str(raw_item.get("target_id") or "").strip()
+            target_url = (
+                f"/?tab=announcements&id={target_id}"
+                if (feature == "Ann" and target_id)
+                else "/?tab=reminders"
+            )
             return {
                 "uid": f"reminder:{item_id}",
                 "type": "reminder",
                 "id": item_id,
-                "title": f"📬 我的提醒：{rem_title}",
+                "feature_name": feature,
+                "title": f"[{type_label}] {rem_title}",
                 "body": (raw_item.get("body") or "點擊查看提醒內容")[:120],
-                "url": "/?tab=reminders",
+                "url": target_url,
                 "tag": f"rem-{item_id}",
                 "discovered_at": now_iso,
                 "is_deleted": False,
@@ -512,11 +539,11 @@ class PushService:
                     if uid not in existing_uids:
                         existing_uids.add(uid)
                         newly_added_chronological.append(candidate)
-                        if is_type_initialized:
+                        if is_type_initialized and msg_type == "reminder":
                             new_non_baseline_events.append(candidate)
                         else:
                             baseline_uids.append(uid)
-                    elif not is_type_initialized:
+                    elif not is_type_initialized or msg_type != "reminder":
                         baseline_uids.append(uid)
 
                 initialized_types.add(msg_type)
@@ -754,9 +781,11 @@ class PushService:
             pushed_uids: list[str] = list(latest_sub.get("pushed_message_uids", []))
             pushed_set = set(pushed_uids)
 
-            # Oldest unpushed first so notifications arrive in chronological order
+            # Oldest unpushed reminder first so notifications arrive in chronological order
             unpushed = [
-                m for m in reversed(messages) if m.get("uid") and m["uid"] not in pushed_set
+                m
+                for m in reversed(messages)
+                if m.get("type") == "reminder" and m.get("uid") and m["uid"] not in pushed_set
             ]
 
             device_expired = False

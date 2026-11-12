@@ -66,26 +66,22 @@ async def ensure_announcement_attachments_cached(announcement_id: str) -> dict[s
 
 
 async def poll_once() -> dict[str, Any]:
-    """Fetch latest announcements, personal notifications, and reminders and push any new items."""
+    """Fetch latest announcements (for attachment backup) and reminders (for Web Push)."""
     async with poll_lock:
         try:
-            ann_data, personal_data, rem_data = await asyncio.gather(
+            ann_data, rem_data = await asyncio.gather(
                 client.get_announcements(offset=0, max_count=10),
-                client.get_personal_notifications(offset=0, max_count=10),
                 client.get_my_reminders(before_datetime=""),
             )
             ann_items = ann_data.get("items", [])
-            personal_items = personal_data.get("items", [])
             rem_items = rem_data.get("items", [])
             logger.debug(
-                "Polled %d announcements, %d personal notifications, %d reminders",
+                "Polled %d announcements, %d reminders",
                 len(ann_items),
-                len(personal_items),
                 len(rem_items),
             )
             events = push_service.sync_messages(
                 announcements=ann_items,
-                personal_notifications=personal_items,
                 reminders=rem_items,
             )
             for ev in events:
@@ -238,21 +234,6 @@ async def serve_cached_attachment(announcement_id: str, filename: str) -> FileRe
     return FileResponse(file_path)
 
 
-@app.get("/api/notifications/personal")
-async def list_personal_notifications(offset: int = 0, max_count: int = 10) -> dict[str, Any]:
-    try:
-        data = await client.get_personal_notifications(offset=offset, max_count=max_count)
-        data["items"] = push_service.merge_with_deleted_items(
-            "personal",
-            data.get("items", []),
-            is_first_page=(offset == 0),
-        )
-        data["total_count"] = len(data["items"])
-        return data
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
 @app.get("/api/notifications/reminders")
 async def list_reminders(before_datetime: str = "") -> dict[str, Any]:
     try:
@@ -293,20 +274,22 @@ async def send_test_push(payload: TestPushPayload | None = None) -> dict[str, An
 
     if not title or not body:
         try:
-            ann = await client.get_announcements(offset=0, max_count=5)
-            personal = await client.get_personal_notifications(offset=0, max_count=5)
+            ann, rem = await asyncio.gather(
+                client.get_announcements(offset=0, max_count=5),
+                client.get_my_reminders(before_datetime=""),
+            )
             latest_ann = ann.get("latest")
-            latest_p = personal.get("latest")
-            title = title or f"🔔 [{ann.get('community_name', '社區')}] 推播測試成功"
+            latest_rem = rem.get("latest")
+            title = title or f"[🔔 推播測試] {ann.get('community_name', '社區')} 通知連線正常"
             parts = []
             if latest_ann:
                 parts.append(f"📢 最新公告：{latest_ann['title']}")
-            if latest_p:
-                parts.append(f"💬 最新通知：{latest_p['content'][:60]}...")
+            if latest_rem:
+                parts.append(f"📬 最新提醒：{latest_rem['body'][:60]}...")
             default_body = "\n".join(parts) if parts else "您的 iOS / 瀏覽器 Web Push 已正常運作！"
             body = body or default_body
         except Exception:
-            title = title or "🔔 智生活社區通知測試"
+            title = title or "[🔔 推播測試] 智生活社區通知測試"
             body = body or "您的 Web Push 推播通知已正常運作！"
 
     result = await asyncio.to_thread(
