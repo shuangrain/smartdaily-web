@@ -37,10 +37,11 @@ def test_push_service_vapid_and_diffing(tmp_path: Path):
     events1 = svc.check_and_record_new_items(
         announcements=[{"id": "100", "title": "舊公告", "content": "內容"}],
         personal_notifications=[{"id": "200", "community": "測試社區", "content": "舊通知"}],
+        reminders=[{"id": "300", "title": "舊提醒", "body": "舊包裹"}],
     )
     assert events1 == []
 
-    # Second run: new announcement & new personal notification arrive
+    # Second run: new announcement, new personal notification, & new reminder arrive
     events2 = svc.check_and_record_new_items(
         announcements=[
             {"id": "101", "title": "新公告", "content": "新內容"},
@@ -50,10 +51,15 @@ def test_push_service_vapid_and_diffing(tmp_path: Path):
             {"id": "201", "community": "測試社區", "content": "新推播通知"},
             {"id": "200", "community": "測試社區", "content": "舊通知"},
         ],
+        reminders=[
+            {"id": "301", "title": "包裹到件通知", "body": "您有一件包裹已送達管理室"},
+            {"id": "300", "title": "舊提醒", "body": "舊包裹"},
+        ],
     )
-    assert len(events2) == 2
+    assert len(events2) == 3
     assert any(e["type"] == "announcement" and e["id"] == "101" for e in events2)
     assert any(e["type"] == "personal" and e["id"] == "201" for e in events2)
+    assert any(e["type"] == "reminder" and e["id"] == "301" for e in events2)
 
 
 def test_push_subscribe_and_unsubscribe(tmp_path: Path):

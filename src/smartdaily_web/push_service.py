@@ -160,22 +160,30 @@ class PushService:
         self,
         announcements: list[dict[str, Any]],
         personal_notifications: list[dict[str, Any]],
+        reminders: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, str]]:
         """
-        Compare current announcements & personal notifications with seen IDs.
-        On first run (no seen_state.json), records current IDs without firing notifications.
+        Compare current announcements, personal notifications & reminders with seen IDs.
+        When a category is seen for the first time, records current IDs as baseline
+        without firing notifications.
         Returns a list of new notification events to push.
         """
+        reminders = reminders or []
         state = self.get_seen_state()
         ann_ids = [str(a["id"]) for a in announcements if a.get("id")]
         notif_ids = [str(n["id"]) for n in personal_notifications if n.get("id")]
+        rem_ids = [str(r["id"]) for r in reminders if r.get("id")]
 
-        is_first_run = not bool(state)
+        has_ann_baseline = "seen_announcement_ids" in state
+        has_notif_baseline = "seen_notification_ids" in state
+        has_rem_baseline = "seen_reminder_ids" in state
+
         seen_ann_ids = set(state.get("seen_announcement_ids", []))
         seen_notif_ids = set(state.get("seen_notification_ids", []))
+        seen_rem_ids = set(state.get("seen_reminder_ids", []))
 
         events: list[dict[str, str]] = []
-        if not is_first_run:
+        if has_ann_baseline:
             for ann in reversed(announcements):
                 aid = str(ann.get("id", ""))
                 if aid and aid not in seen_ann_ids:
@@ -190,6 +198,7 @@ class PushService:
                         }
                     )
 
+        if has_notif_baseline:
             for notif in reversed(personal_notifications):
                 nid = str(notif.get("id", ""))
                 if nid and nid not in seen_notif_ids:
@@ -204,9 +213,26 @@ class PushService:
                         }
                     )
 
+        if has_rem_baseline:
+            for rem in reversed(reminders):
+                rid = str(rem.get("id", ""))
+                if rid and rid not in seen_rem_ids:
+                    rem_title = rem.get("title") or "新提醒通知"
+                    events.append(
+                        {
+                            "type": "reminder",
+                            "id": rid,
+                            "title": f"📬 我的提醒：{rem_title}",
+                            "body": (rem.get("body") or "點擊查看提醒內容")[:120],
+                            "url": "/?tab=reminders",
+                            "tag": f"rem-{rid}",
+                        }
+                    )
+
         new_state = {
             "seen_announcement_ids": list(dict.fromkeys(ann_ids + list(seen_ann_ids)))[:100],
             "seen_notification_ids": list(dict.fromkeys(notif_ids + list(seen_notif_ids)))[:100],
+            "seen_reminder_ids": list(dict.fromkeys(rem_ids + list(seen_rem_ids)))[:100],
         }
         self.save_seen_state(new_state)
         return events

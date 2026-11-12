@@ -45,22 +45,26 @@ poll_status: dict[str, Any] = {
 
 
 async def poll_once() -> dict[str, Any]:
-    """Fetch latest announcements and personal notifications and push any new items."""
+    """Fetch latest announcements, personal notifications, and reminders and push any new items."""
     try:
-        ann_data, personal_data = await asyncio.gather(
+        ann_data, personal_data, rem_data = await asyncio.gather(
             client.get_announcements(offset=0, max_count=10),
             client.get_personal_notifications(offset=0, max_count=10),
+            client.get_my_reminders(before_datetime=""),
         )
         ann_items = ann_data.get("items", [])
         personal_items = personal_data.get("items", [])
+        rem_items = rem_data.get("items", [])
         logger.debug(
-            "Polled %d announcements, %d personal notifications",
+            "Polled %d announcements, %d personal notifications, %d reminders",
             len(ann_items),
             len(personal_items),
+            len(rem_items),
         )
         events = push_service.check_and_record_new_items(
             announcements=ann_items,
             personal_notifications=personal_items,
+            reminders=rem_items,
         )
         pushed_count = 0
         for ev in events:
