@@ -86,6 +86,8 @@
       transition: all 0.15s;
     }
     .btn:hover { background: var(--card-hover); }
+    .btn:disabled { cursor: not-allowed; opacity: 0.7; }
+    .btn:disabled:hover { background: var(--card); }
     .btn-primary {
       background: var(--primary-dark);
       border-color: var(--primary);
@@ -403,6 +405,9 @@
     let isLoadingMore = false;
     let autoLoadErrorPaused = false;
     let loadGeneration = 0;
+    let pollIsRunning = false;
+    let manualPollPending = false;
+    const POLL_STATUS_REFRESH_INTERVAL_MS = 1000;
 
     function showToast(msg) {
       const t = document.getElementById("toast");
@@ -430,10 +435,20 @@
       return outputArray;
     }
 
+    function updateRefreshButton() {
+      const refreshButton = document.getElementById("refreshBtn");
+      const isBusy = pollIsRunning || manualPollPending;
+      refreshButton.disabled = isBusy;
+      refreshButton.textContent = isBusy ? "⏳ 更新中" : "⚡ 立即更新";
+      refreshButton.setAttribute("aria-busy", String(isBusy));
+    }
+
     async function loadStatus() {
       try {
         const res = await fetch("/api/status");
         const data = await res.json();
+        pollIsRunning = Boolean(data.poll?.is_running);
+        updateRefreshButton();
         document.getElementById("communityName").textContent = data.community_name || "社區通知";
         document.getElementById("statusSub").textContent =
           `已濾除平台廣告 ｜ 推播訂閱裝置：${data.subscribers_count} 台`;
@@ -863,16 +878,21 @@
       });
     });
     document.getElementById("refreshBtn").addEventListener("click", async () => {
+      if (manualPollPending) return;
       clearAppBadgeIfSupported();
+      manualPollPending = true;
+      updateRefreshButton();
       try {
         const beforeResponse = await fetch("/api/status");
         const beforeStatus = await beforeResponse.json();
+        pollIsRunning = Boolean(beforeStatus.poll?.is_running);
+        updateRefreshButton();
         const previousTraceId = beforeStatus.poll?.last_trace_id;
         const res = await fetch("/api/poll-now", { method: "POST" });
         const data = await res.json();
         showToast(data.started ? "🔄 正在更新公告與提醒..." : "⏳ 背景更新已在執行中");
 
-        let observedPoll = Boolean(beforeStatus.poll?.is_running);
+        let observedPoll = pollIsRunning;
         while (true) {
           await new Promise((resolve) => setTimeout(resolve, 1000));
           const statusResponse = await fetch("/api/status");
@@ -881,19 +901,24 @@
           if (poll.is_running || (poll.last_trace_id && poll.last_trace_id !== previousTraceId)) {
             observedPoll = true;
           }
-          if (observedPoll && !poll.is_running) break;
+          pollIsRunning = Boolean(poll.is_running);
+          updateRefreshButton();
+          if (observedPoll && !pollIsRunning) break;
         }
 
-        await loadStatus();
         await loadTabContent(currentTab);
         showToast("✅ 公告與提醒已更新");
       } catch (err) {
         showToast("更新失敗：" + err.message);
+      } finally {
+        manualPollPending = false;
+        await loadStatus();
       }
     });
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") {
         clearAppBadgeIfSupported();
+        loadStatus();
       }
     });
     window.addEventListener("focus", clearAppBadgeIfSupported);
@@ -936,6 +961,9 @@
       await clearAppBadgeIfSupported();
       await initServiceWorker();
       await loadStatus();
+      window.setInterval(() => {
+        if (document.visibilityState === "visible") loadStatus();
+      }, POLL_STATUS_REFRESH_INTERVAL_MS);
       const params = new URLSearchParams(window.location.search);
       const tabParam = params.get("tab");
       const idParam = params.get("id");

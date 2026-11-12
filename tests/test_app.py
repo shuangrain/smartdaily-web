@@ -1701,6 +1701,29 @@ def test_frontend_ui_conventions_tabs_filters_infinite_scroll_and_emoji_spacing(
     assert "本機只保存了提醒中的摘要" not in html_text
 
 
+def test_frontend_refresh_button_tracks_background_poll_state():
+    index_path = (
+        Path(__file__).resolve().parent.parent / "src" / "smartdaily_web" / "static" / "index.html"
+    )
+    html_text = index_path.read_text(encoding="utf-8")
+
+    assert "function updateRefreshButton() {" in html_text
+    assert "refreshButton.disabled = isBusy;" in html_text
+    assert 'refreshButton.textContent = isBusy ? "⏳ 更新中" : "⚡ 立即更新";' in html_text
+    assert "pollIsRunning = Boolean(data.poll?.is_running);" in html_text
+    assert "POLL_STATUS_REFRESH_INTERVAL_MS" in html_text
+    assert "window.setInterval(() => {" in html_text
+    assert 'if (document.visibilityState === "visible") loadStatus();' in html_text
+    assert ".btn:disabled" in html_text
+
+    refresh_handler = html_text.split(
+        'document.getElementById("refreshBtn").addEventListener("click", async () => {'
+    )[1].split("    });", 1)[0]
+    assert "manualPollPending = true;" in refresh_handler
+    assert "manualPollPending = false;" in refresh_handler
+    assert "updateRefreshButton();" in refresh_handler
+
+
 def test_frontend_test_push_uses_only_the_current_browser_subscription():
     index_path = (
         Path(__file__).resolve().parent.parent / "src" / "smartdaily_web" / "static" / "index.html"
