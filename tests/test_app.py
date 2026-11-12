@@ -125,11 +125,18 @@ def test_push_service_vapid_and_per_device_push_tracking(tmp_path: Path, monkeyp
 
 def test_push_subscribe_and_unsubscribe(tmp_path: Path):
     svc = PushService(data_dir=tmp_path)
-    sub = {
-        "endpoint": "https://web.push.apple.com/test-endpoint",
-        "keys": {"p256dh": "k", "auth": "a"},
+    sub1 = {
+        "endpoint": "https://web.push.apple.com/test-endpoint-1",
+        "keys": {"p256dh": "k1", "auth": "a1"},
     }
-    assert svc.add_subscription(sub, user_agent="iPhone") == 1
-    assert len(svc.get_subscriptions()) == 1
-    assert svc.remove_subscription("https://web.push.apple.com/test-endpoint") == 0
-    assert len(svc.get_subscriptions()) == 0
+    sub2 = {
+        "endpoint": "https://web.push.apple.com/test-endpoint-2",
+        "keys": {"p256dh": "k2", "auth": "a2"},
+    }
+    assert svc.add_subscription(sub1, user_agent="iPhone") == 1
+    assert svc.add_subscription(sub2, user_agent="iPad") == 2
+    assert len(list((tmp_path / "devices").glob("*.json"))) == 2
+    assert svc.remove_subscription("https://web.push.apple.com/test-endpoint-1") == 1
+    assert len(list((tmp_path / "devices").glob("*.json"))) == 1
+    assert svc.remove_subscription("https://web.push.apple.com/test-endpoint-2") == 0
+    assert len(list((tmp_path / "devices").glob("*.json"))) == 0

@@ -25,6 +25,13 @@ def _make_device_id(endpoint: str) -> str:
     return hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:12]
 
 
+def _atomic_write_json(path: Path, data: Any) -> None:
+    """Atomically write JSON data to path via a temporary file rename."""
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}")
+    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
 class PushService:
     """Manages VAPID keys, central message store, and per-device Web Push delivery."""
 
@@ -32,12 +39,15 @@ class PushService:
         base_dir = Path(data_dir or os.getenv("DATA_DIR", "./data"))
         base_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir = base_dir
+        self.devices_dir = self.data_dir / "devices"
+        self.devices_dir.mkdir(parents=True, exist_ok=True)
         self.vapid_file = self.data_dir / "vapid_keys.json"
-        self.subs_file = self.data_dir / "subscriptions.json"
         self.messages_file = self.data_dir / "messages.json"
+        self.legacy_subs_file = self.data_dir / "subscriptions.json"
         self.legacy_seen_file = self.data_dir / "seen_state.json"
         self.vapid_subject = os.getenv("VAPID_SUBJECT", "mailto:admin@example.com")
         self.public_key, self.private_key = self._load_or_create_vapid_keys()
+        self._migrate_legacy_subscriptions()
 
     def _load_or_create_vapid_keys(self) -> tuple[str, str]:
         """Load VAPID keys from env or disk, or generate a new EC P-256 keypair."""
@@ -96,37 +106,84 @@ class PushService:
         return self.get_message_store()["messages"]
 
     def save_message_store(self, store: dict[str, Any]) -> None:
-        """Persist the central message store to messages.json."""
+        """Persist the central message store to messages.json atomically."""
         payload = {
             "initialized_types": list(dict.fromkeys(store.get("initialized_types", []))),
             "messages": list(store.get("messages", []))[:MAX_STORED_MESSAGES],
         }
-        self.messages_file.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        _atomic_write_json(self.messages_file, payload)
 
     # -------------------------------------------------------------------------
-    # Subscriptions & Per-Device Pushed State (data/subscriptions.json)
+    # Per-Device Files (data/devices/<device_id>.json)
     # -------------------------------------------------------------------------
-    def get_subscriptions(self) -> list[dict[str, Any]]:
-        if not self.subs_file.is_file():
-            return []
+    def _device_file(self, device_id: str) -> Path:
+        return self.devices_dir / f"{device_id}.json"
+
+    def _migrate_legacy_subscriptions(self) -> None:
+        """Migrate legacy data/subscriptions.json into per-device files in data/devices/."""
+        if not self.legacy_subs_file.is_file():
+            return
         try:
-            raw_subs = json.loads(self.subs_file.read_text(encoding="utf-8"))
-            for sub in raw_subs:
-                if "device_id" not in sub and sub.get("endpoint"):
-                    sub["device_id"] = _make_device_id(sub["endpoint"])
-            return raw_subs
-        except Exception:
-            return []
+            raw_subs = json.loads(self.legacy_subs_file.read_text(encoding="utf-8"))
+            if isinstance(raw_subs, list):
+                for sub in raw_subs:
+                    endpoint = sub.get("endpoint")
+                    if not endpoint:
+                        continue
+                    device_id = sub.get("device_id") or _make_device_id(endpoint)
+                    sub["device_id"] = device_id
+                    dev_path = self._device_file(device_id)
+                    if not dev_path.is_file():
+                        _atomic_write_json(dev_path, sub)
+            self.legacy_subs_file.unlink()
+        except Exception as exc:
+            logger.warning("Failed to migrate legacy subscriptions.json: %s", exc)
 
-    def save_subscriptions(self, subs: list[dict[str, Any]]) -> None:
-        self.subs_file.write_text(json.dumps(subs, ensure_ascii=False, indent=2), encoding="utf-8")
+    def get_device_subscription(self, device_id: str) -> dict[str, Any] | None:
+        """Read a single device's subscription and pushed state file."""
+        dev_path = self._device_file(device_id)
+        if not dev_path.is_file():
+            return None
+        try:
+            sub = json.loads(dev_path.read_text(encoding="utf-8"))
+            if "device_id" not in sub and sub.get("endpoint"):
+                sub["device_id"] = device_id
+            return sub
+        except Exception:
+            return None
+
+    def save_device_subscription(self, sub: dict[str, Any]) -> None:
+        """Atomically save a single device's subscription file."""
+        endpoint = sub.get("endpoint", "")
+        device_id = sub.get("device_id") or _make_device_id(endpoint)
+        sub["device_id"] = device_id
+        _atomic_write_json(self._device_file(device_id), sub)
+
+    def delete_device_subscription(self, device_id: str) -> None:
+        """Delete a single device's subscription file if it exists."""
+        dev_path = self._device_file(device_id)
+        if dev_path.is_file():
+            try:
+                dev_path.unlink()
+            except Exception:
+                pass
+
+    def get_subscriptions(self) -> list[dict[str, Any]]:
+        """Return all active device subscriptions from data/devices/*.json."""
+        subs: list[dict[str, Any]] = []
+        for path in sorted(self.devices_dir.glob("*.json")):
+            try:
+                sub = json.loads(path.read_text(encoding="utf-8"))
+                if sub.get("endpoint"):
+                    sub.setdefault("device_id", _make_device_id(sub["endpoint"]))
+                    subs.append(sub)
+            except Exception:
+                continue
+        return subs
 
     def add_subscription(self, subscription: dict[str, Any], user_agent: str = "") -> int:
         """
-        Register or update a device subscription.
+        Register or update a single device subscription in data/devices/<device_id>.json.
         New devices initialize pushed_message_uids with currently stored messages
         so they only receive messages arriving after subscription time.
         """
@@ -134,8 +191,8 @@ class PushService:
         if not endpoint:
             raise ValueError("Invalid push subscription: missing endpoint")
 
-        current_Subs = self.get_subscriptions()
-        existing = next((s for s in current_Subs if s.get("endpoint") == endpoint), None)
+        device_id = _make_device_id(endpoint)
+        existing = self.get_device_subscription(device_id)
         known_uids = [m["uid"] for m in self.get_messages() if m.get("uid")]
 
         if existing and "pushed_message_uids" in existing:
@@ -145,10 +202,9 @@ class PushService:
             pushed_uids = known_uids[:MAX_DEVICE_PUSHED_UIDS]
             subscribed_at = datetime.now(timezone.utc).isoformat()
 
-        subs = [s for s in current_Subs if s.get("endpoint") != endpoint]
-        subs.append(
+        self.save_device_subscription(
             {
-                "device_id": _make_device_id(endpoint),
+                "device_id": device_id,
                 "endpoint": endpoint,
                 "keys": subscription.get("keys", {}),
                 "user_agent": user_agent,
@@ -156,13 +212,13 @@ class PushService:
                 "pushed_message_uids": pushed_uids,
             }
         )
-        self.save_subscriptions(subs)
-        return len(subs)
+        return len(self.get_subscriptions())
 
     def remove_subscription(self, endpoint: str) -> int:
-        subs = [s for s in self.get_subscriptions() if s.get("endpoint") != endpoint]
-        self.save_subscriptions(subs)
-        return len(subs)
+        """Remove a single device's subscription file without touching other devices."""
+        device_id = _make_device_id(endpoint)
+        self.delete_device_subscription(device_id)
+        return len(self.get_subscriptions())
 
     # -------------------------------------------------------------------------
     # Message Sync & Per-Device Web Push Delivery
@@ -230,22 +286,20 @@ class PushService:
 
         sent = 0
         failed = 0
-        valid_subs = []
+        active_count = 0
         for sub in subs:
             status = self._send_single_push(sub, payload_dict)
             if status == "sent":
                 sent += 1
-                valid_subs.append(sub)
+                active_count += 1
             elif status == "expired":
                 failed += 1
+                self.delete_device_subscription(sub["device_id"])
             else:
                 failed += 1
-                valid_subs.append(sub)
+                active_count += 1
 
-        if len(valid_subs) != len(subs):
-            self.save_subscriptions(valid_subs)
-
-        return {"sent": sent, "failed": failed, "active_subscribers": len(valid_subs)}
+        return {"sent": sent, "failed": failed, "active_subscribers": active_count}
 
     def sync_messages(
         self,
@@ -257,8 +311,8 @@ class PushService:
         Record fetched announcements, personal notifications, and reminders into
         the central message store (data/messages.json).
         When a category is initialized for the first time, its current items are
-        recorded into the message store AND marked as baseline in all existing
-        devices so old historical messages do not trigger push floods.
+        recorded into the message store AND marked as baseline in each existing
+        device file so old historical messages do not trigger push floods.
         Returns the list of newly discovered non-baseline messages.
         """
         reminders = reminders or []
@@ -357,21 +411,20 @@ class PushService:
             }
         )
 
-        # Ensure existing devices have baseline UIDs (or legacy migration) recorded
-        subs = self.get_subscriptions()
-        subs_modified = False
+        # Ensure each existing device file has baseline UIDs recorded independently
         all_current_uids = [m["uid"] for m in updated_messages]
-        for sub in subs:
-            if "pushed_message_uids" not in sub:
-                sub["pushed_message_uids"] = list(all_current_uids)[:MAX_DEVICE_PUSHED_UIDS]
-                subs_modified = True
+        for sub in self.get_subscriptions():
+            device_id = sub["device_id"]
+            latest_sub = self.get_device_subscription(device_id)
+            if not latest_sub:
+                continue
+            if "pushed_message_uids" not in latest_sub:
+                latest_sub["pushed_message_uids"] = list(all_current_uids)[:MAX_DEVICE_PUSHED_UIDS]
+                self.save_device_subscription(latest_sub)
             elif baseline_uids:
-                merged = list(dict.fromkeys(baseline_uids + sub["pushed_message_uids"]))
-                sub["pushed_message_uids"] = merged[:MAX_DEVICE_PUSHED_UIDS]
-                subs_modified = True
-
-        if subs_modified:
-            self.save_subscriptions(subs)
+                merged = list(dict.fromkeys(baseline_uids + latest_sub["pushed_message_uids"]))
+                latest_sub["pushed_message_uids"] = merged[:MAX_DEVICE_PUSHED_UIDS]
+                self.save_device_subscription(latest_sub)
 
         # Clean up obsolete seen_state.json if present
         if self.legacy_seen_file.is_file():
@@ -397,9 +450,9 @@ class PushService:
 
     def push_unpushed_messages(self) -> dict[str, Any]:
         """
-        For each subscribed device, find messages in messages.json that have not
-        yet been pushed to that specific device, send Web Push, and record
-        successfully pushed message UIDs per device.
+        For each subscribed device file in data/devices/<device_id>.json, find
+        messages in data/messages.json not yet pushed to that device, send Web Push,
+        and update only that device's file atomically.
         """
         messages = self.get_messages()
         subs = self.get_subscriptions()
@@ -409,19 +462,19 @@ class PushService:
         all_current_uids = [m["uid"] for m in messages if m.get("uid")]
         sent = 0
         failed = 0
-        valid_subs: list[dict[str, Any]] = []
-        subs_changed = False
+        active_count = 0
 
         for sub in subs:
-            device_id = sub.get("device_id") or _make_device_id(sub.get("endpoint", ""))
-            sub["device_id"] = device_id
+            device_id = sub["device_id"]
+            latest_sub = self.get_device_subscription(device_id)
+            if not latest_sub:
+                continue
 
-            # If migrating a legacy subscription before sync_messages ran
-            if "pushed_message_uids" not in sub:
-                sub["pushed_message_uids"] = list(all_current_uids)[:MAX_DEVICE_PUSHED_UIDS]
-                subs_changed = True
+            if "pushed_message_uids" not in latest_sub:
+                latest_sub["pushed_message_uids"] = list(all_current_uids)[:MAX_DEVICE_PUSHED_UIDS]
+                self.save_device_subscription(latest_sub)
 
-            pushed_uids: list[str] = list(sub.get("pushed_message_uids", []))
+            pushed_uids: list[str] = list(latest_sub.get("pushed_message_uids", []))
             pushed_set = set(pushed_uids)
 
             # Oldest unpushed first so notifications arrive in chronological order
@@ -440,7 +493,7 @@ class PushService:
                     device_id,
                     msg["title"],
                 )
-                status = self._send_single_push(sub, msg)
+                status = self._send_single_push(latest_sub, msg)
                 if status == "sent":
                     sent += 1
                     newly_pushed_for_device.append(msg["uid"])
@@ -448,26 +501,26 @@ class PushService:
                 elif status == "expired":
                     failed += 1
                     device_expired = True
-                    subs_changed = True
+                    self.delete_device_subscription(device_id)
                     break
                 else:
                     failed += 1
 
             if not device_expired:
+                active_count += 1
                 if newly_pushed_for_device:
-                    # Keep most recently pushed UIDs at the front
-                    merged = list(
-                        dict.fromkeys(list(reversed(newly_pushed_for_device)) + pushed_uids)
-                    )
-                    sub["pushed_message_uids"] = merged[:MAX_DEVICE_PUSHED_UIDS]
-                    subs_changed = True
-                valid_subs.append(sub)
-
-        if subs_changed or len(valid_subs) != len(subs):
-            self.save_subscriptions(valid_subs)
+                    # Re-read device file in case it was updated or removed concurrently
+                    current_on_disk = self.get_device_subscription(device_id)
+                    if current_on_disk is not None:
+                        disk_uids = list(current_on_disk.get("pushed_message_uids", []))
+                        merged = list(
+                            dict.fromkeys(list(reversed(newly_pushed_for_device)) + disk_uids)
+                        )
+                        current_on_disk["pushed_message_uids"] = merged[:MAX_DEVICE_PUSHED_UIDS]
+                        self.save_device_subscription(current_on_disk)
 
         return {
             "sent": sent,
             "failed": failed,
-            "active_subscribers": len(valid_subs),
+            "active_subscribers": active_count,
         }
