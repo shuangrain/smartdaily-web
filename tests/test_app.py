@@ -140,3 +140,36 @@ def test_push_subscribe_and_unsubscribe(tmp_path: Path):
     assert len(list((tmp_path / "devices").glob("*.json"))) == 1
     assert svc.remove_subscription("https://web.push.apple.com/test-endpoint-2") == 0
     assert len(list((tmp_path / "devices").glob("*.json"))) == 0
+
+
+def test_recalled_message_is_deleted_and_merged_for_display(tmp_path: Path):
+    svc = PushService(data_dir=tmp_path)
+    svc.sync_messages(
+        announcements=[
+            {"id": "101", "title": "誤發的公告", "content": "這則之後會被回收"},
+            {"id": "100", "title": "正常公告", "content": "正常保留"},
+        ],
+        personal_notifications=[],
+        reminders=[],
+    )
+    msgs_initial = svc.get_messages()
+    assert len(msgs_initial) == 2
+    assert all(m["is_deleted"] is False for m in msgs_initial)
+
+    # Now announcement 101 is recalled on SmartDaily (only 100 is returned by live API)
+    merged = svc.merge_with_deleted_items(
+        "announcement",
+        [{"id": "100", "title": "正常公告", "content": "正常保留"}],
+        is_first_page=True,
+    )
+    assert len(merged) == 2
+    recalled = next(i for i in merged if i["id"] == "101")
+    active = next(i for i in merged if i["id"] == "100")
+    assert recalled["is_deleted"] is True
+    assert recalled["title"] == "誤發的公告"
+    assert active["is_deleted"] is False
+
+    detail = svc.get_stored_announcement_detail("101")
+    assert detail is not None
+    assert detail["is_deleted"] is True
+    assert detail["content"] == "這則之後會被回收"

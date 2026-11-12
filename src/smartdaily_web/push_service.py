@@ -17,12 +17,16 @@ from pywebpush import WebPushException, webpush
 
 logger = logging.getLogger(__name__)
 
-MAX_STORED_MESSAGES = 500
-MAX_DEVICE_PUSHED_UIDS = 500
-
 
 def _make_device_id(endpoint: str) -> str:
     return hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:12]
+
+
+def _safe_int(val: Any) -> int | None:
+    try:
+        return int(str(val))
+    except (ValueError, TypeError):
+        return None
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -106,10 +110,10 @@ class PushService:
         return self.get_message_store()["messages"]
 
     def save_message_store(self, store: dict[str, Any]) -> None:
-        """Persist the central message store to messages.json atomically."""
+        """Persist all messages to messages.json atomically without upper limit."""
         payload = {
             "initialized_types": list(dict.fromkeys(store.get("initialized_types", []))),
-            "messages": list(store.get("messages", []))[:MAX_STORED_MESSAGES],
+            "messages": list(store.get("messages", [])),
         }
         _atomic_write_json(self.messages_file, payload)
 
@@ -199,7 +203,7 @@ class PushService:
             pushed_uids = list(existing["pushed_message_uids"])
             subscribed_at = existing.get("subscribed_at") or datetime.now(timezone.utc).isoformat()
         else:
-            pushed_uids = known_uids[:MAX_DEVICE_PUSHED_UIDS]
+            pushed_uids = list(known_uids)
             subscribed_at = datetime.now(timezone.utc).isoformat()
 
         self.save_device_subscription(
@@ -301,109 +305,214 @@ class PushService:
 
         return {"sent": sent, "failed": failed, "active_subscribers": active_count}
 
+    @staticmethod
+    def _build_candidate_record(
+        msg_type: str, raw_item: dict[str, Any], now_iso: str
+    ) -> dict[str, Any] | None:
+        item_id = str(raw_item.get("id", ""))
+        if not item_id:
+            return None
+        item_copy = dict(raw_item)
+        item_copy["is_deleted"] = False
+
+        if msg_type == "announcement":
+            return {
+                "uid": f"announcement:{item_id}",
+                "type": "announcement",
+                "id": item_id,
+                "title": f"📢 新社區公告：{raw_item.get('title', '')}",
+                "body": (raw_item.get("content") or "點擊查看公告詳情與附件")[:120],
+                "url": f"/?tab=announcements&id={item_id}",
+                "tag": f"ann-{item_id}",
+                "discovered_at": now_iso,
+                "is_deleted": False,
+                "item": item_copy,
+            }
+        if msg_type == "personal":
+            return {
+                "uid": f"personal:{item_id}",
+                "type": "personal",
+                "id": item_id,
+                "title": f"🔔 社區個人通知（{raw_item.get('community', '物管中心')}）",
+                "body": (raw_item.get("content") or "")[:120],
+                "url": "/?tab=personal",
+                "tag": f"notif-{item_id}",
+                "discovered_at": now_iso,
+                "is_deleted": False,
+                "item": item_copy,
+            }
+        if msg_type == "reminder":
+            rem_title = raw_item.get("title") or "新提醒通知"
+            return {
+                "uid": f"reminder:{item_id}",
+                "type": "reminder",
+                "id": item_id,
+                "title": f"📬 我的提醒：{rem_title}",
+                "body": (raw_item.get("body") or "點擊查看提醒內容")[:120],
+                "url": "/?tab=reminders",
+                "tag": f"rem-{item_id}",
+                "discovered_at": now_iso,
+                "is_deleted": False,
+                "item": item_copy,
+            }
+        return None
+
+    @staticmethod
+    def _reconstruct_display_item(msg: dict[str, Any]) -> dict[str, Any]:
+        """Reconstruct a frontend-ready item dict from a stored message record."""
+        is_deleted = bool(msg.get("is_deleted", False))
+        if isinstance(msg.get("item"), dict):
+            item = dict(msg["item"])
+            item["is_deleted"] = is_deleted
+            return item
+
+        msg_type = msg.get("type", "")
+        raw_title = str(msg.get("title", ""))
+        for prefix in ("📢 新社區公告：", "📬 我的提醒："):
+            if raw_title.startswith(prefix):
+                raw_title = raw_title[len(prefix) :]
+        if msg_type == "announcement":
+            return {
+                "id": str(msg.get("id", "")),
+                "title": raw_title,
+                "content": msg.get("body", ""),
+                "create_date": msg.get("discovered_at", "")[:16].replace("T", " "),
+                "start_date": "",
+                "is_top": False,
+                "type_name": "公告",
+                "is_deleted": is_deleted,
+            }
+        if msg_type == "personal":
+            return {
+                "id": str(msg.get("id", "")),
+                "community": "物管中心",
+                "content": msg.get("body", ""),
+                "push_date": msg.get("discovered_at", "")[:16].replace("T", " "),
+                "files": [],
+                "is_deleted": is_deleted,
+            }
+        return {
+            "id": str(msg.get("id", "")),
+            "title": raw_title,
+            "body": msg.get("body", ""),
+            "pushing_time": msg.get("discovered_at", ""),
+            "has_read": True,
+            "feature_name": "提醒",
+            "target_id": "",
+            "files": [],
+            "is_deleted": is_deleted,
+        }
+
+    @staticmethod
+    def _update_deleted_flags_for_type(
+        existing_messages: list[dict[str, Any]],
+        msg_type: str,
+        live_items: list[dict[str, Any]],
+        page_size: int = 10,
+    ) -> None:
+        """
+        Mark stored messages of msg_type as is_deleted=True if they are missing
+        from the latest top-page response and were not merely pushed to page 2.
+        """
+        live_by_id = {str(it.get("id", "")): it for it in live_items if it.get("id")}
+        has_more_pages = len(live_items) >= page_size
+
+        # Compute minimum numeric ID on the current top page to distinguish pagination vs deletion
+        if msg_type == "announcement":
+            non_top_ids = [
+                _safe_int(it.get("id"))
+                for it in live_items
+                if not it.get("is_top") and _safe_int(it.get("id")) is not None
+            ]
+            all_ids = [
+                _safe_int(it.get("id")) for it in live_items if _safe_int(it.get("id")) is not None
+            ]
+            cutoff_int_id = min(non_top_ids) if non_top_ids else (min(all_ids) if all_ids else None)
+        else:
+            all_ids = [
+                _safe_int(it.get("id")) for it in live_items if _safe_int(it.get("id")) is not None
+            ]
+            cutoff_int_id = min(all_ids) if all_ids else None
+
+        for msg in existing_messages:
+            if msg.get("type") != msg_type:
+                continue
+            mid = str(msg.get("id", ""))
+            if mid in live_by_id:
+                msg["is_deleted"] = False
+                item_copy = dict(live_by_id[mid])
+                item_copy["is_deleted"] = False
+                msg["item"] = item_copy
+            else:
+                msg.setdefault("is_deleted", False)
+                if not has_more_pages:
+                    msg["is_deleted"] = True
+                elif cutoff_int_id is not None:
+                    stored_int_id = _safe_int(mid)
+                    if stored_int_id is not None and stored_int_id >= cutoff_int_id:
+                        msg["is_deleted"] = True
+                if isinstance(msg.get("item"), dict):
+                    msg["item"]["is_deleted"] = bool(msg["is_deleted"])
+
     def sync_messages(
         self,
-        announcements: list[dict[str, Any]],
-        personal_notifications: list[dict[str, Any]],
+        announcements: list[dict[str, Any]] | None = None,
+        personal_notifications: list[dict[str, Any]] | None = None,
         reminders: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Record fetched announcements, personal notifications, and reminders into
-        the central message store (data/messages.json).
+        the central message store (data/messages.json) without upper limit, and
+        update is_deleted flags for recalled messages.
         When a category is initialized for the first time, its current items are
         recorded into the message store AND marked as baseline in each existing
         device file so old historical messages do not trigger push floods.
         Returns the list of newly discovered non-baseline messages.
         """
-        reminders = reminders or []
         now_iso = datetime.now(timezone.utc).isoformat()
         store = self.get_message_store()
         initialized_types = set(store["initialized_types"])
         existing_messages = store["messages"]
         existing_uids = {m["uid"] for m in existing_messages if m.get("uid")}
 
-        # Build normalized message candidates in chronological order (oldest -> newest)
-        candidates_by_type: dict[str, list[dict[str, Any]]] = {
-            "announcement": [],
-            "personal": [],
-            "reminder": [],
+        inputs_by_type: dict[str, list[dict[str, Any]] | None] = {
+            "announcement": announcements,
+            "personal": personal_notifications,
+            "reminder": reminders,
         }
-
-        for ann in reversed(announcements):
-            aid = str(ann.get("id", ""))
-            if not aid:
-                continue
-            candidates_by_type["announcement"].append(
-                {
-                    "uid": f"announcement:{aid}",
-                    "type": "announcement",
-                    "id": aid,
-                    "title": f"📢 新社區公告：{ann.get('title', '')}",
-                    "body": (ann.get("content") or "點擊查看公告詳情與附件")[:120],
-                    "url": f"/?tab=announcements&id={aid}",
-                    "tag": f"ann-{aid}",
-                    "discovered_at": now_iso,
-                }
-            )
-
-        for notif in reversed(personal_notifications):
-            nid = str(notif.get("id", ""))
-            if not nid:
-                continue
-            candidates_by_type["personal"].append(
-                {
-                    "uid": f"personal:{nid}",
-                    "type": "personal",
-                    "id": nid,
-                    "title": f"🔔 社區個人通知（{notif.get('community', '物管中心')}）",
-                    "body": (notif.get("content") or "")[:120],
-                    "url": "/?tab=personal",
-                    "tag": f"notif-{nid}",
-                    "discovered_at": now_iso,
-                }
-            )
-
-        for rem in reversed(reminders):
-            rid = str(rem.get("id", ""))
-            if not rid:
-                continue
-            rem_title = rem.get("title") or "新提醒通知"
-            candidates_by_type["reminder"].append(
-                {
-                    "uid": f"reminder:{rid}",
-                    "type": "reminder",
-                    "id": rid,
-                    "title": f"📬 我的提醒：{rem_title}",
-                    "body": (rem.get("body") or "點擊查看提醒內容")[:120],
-                    "url": "/?tab=reminders",
-                    "tag": f"rem-{rid}",
-                    "discovered_at": now_iso,
-                }
-            )
 
         newly_added_chronological: list[dict[str, Any]] = []
         new_non_baseline_events: list[dict[str, Any]] = []
         baseline_uids: list[str] = []
 
-        for msg_type in ("announcement", "personal", "reminder"):
+        for msg_type, raw_list in inputs_by_type.items():
+            if raw_list is None:
+                continue
+            self._update_deleted_flags_for_type(existing_messages, msg_type, raw_list)
             is_type_initialized = msg_type in initialized_types
-            for item in candidates_by_type[msg_type]:
-                uid = item["uid"]
+
+            for raw_item in reversed(raw_list):
+                candidate = self._build_candidate_record(msg_type, raw_item, now_iso)
+                if not candidate:
+                    continue
+                uid = candidate["uid"]
                 if uid not in existing_uids:
                     existing_uids.add(uid)
-                    newly_added_chronological.append(item)
+                    newly_added_chronological.append(candidate)
                     if is_type_initialized:
-                        new_non_baseline_events.append(item)
+                        new_non_baseline_events.append(candidate)
                     else:
                         baseline_uids.append(uid)
                 elif not is_type_initialized:
                     baseline_uids.append(uid)
+
             initialized_types.add(msg_type)
 
-        # Newest messages stored at the top of messages.json
-        updated_messages = (list(reversed(newly_added_chronological)) + existing_messages)[
-            :MAX_STORED_MESSAGES
-        ]
+        # Ensure all existing messages have is_deleted boolean
+        for m in existing_messages:
+            m.setdefault("is_deleted", False)
+
+        updated_messages = list(reversed(newly_added_chronological)) + existing_messages
         self.save_message_store(
             {
                 "initialized_types": list(initialized_types),
@@ -419,11 +528,11 @@ class PushService:
             if not latest_sub:
                 continue
             if "pushed_message_uids" not in latest_sub:
-                latest_sub["pushed_message_uids"] = list(all_current_uids)[:MAX_DEVICE_PUSHED_UIDS]
+                latest_sub["pushed_message_uids"] = list(all_current_uids)
                 self.save_device_subscription(latest_sub)
             elif baseline_uids:
                 merged = list(dict.fromkeys(baseline_uids + latest_sub["pushed_message_uids"]))
-                latest_sub["pushed_message_uids"] = merged[:MAX_DEVICE_PUSHED_UIDS]
+                latest_sub["pushed_message_uids"] = merged
                 self.save_device_subscription(latest_sub)
 
         # Clean up obsolete seen_state.json if present
@@ -434,6 +543,80 @@ class PushService:
                 pass
 
         return new_non_baseline_events
+
+    def merge_with_deleted_items(
+        self,
+        msg_type: str,
+        live_items: list[dict[str, Any]],
+        is_first_page: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        Sync first-page live items into messages.json and return a merged list
+        containing live items (is_deleted=False) and recalled items (is_deleted=True).
+        """
+        if is_first_page:
+            kwargs: dict[str, Any] = {
+                "announcements": live_items if msg_type == "announcement" else None,
+                "personal_notifications": live_items if msg_type == "personal" else None,
+                "reminders": live_items if msg_type == "reminder" else None,
+            }
+            self.sync_messages(**kwargs)
+
+        live_ids = {str(it.get("id", "")) for it in live_items if it.get("id")}
+        result_items = [dict(it, is_deleted=False) for it in live_items]
+
+        if not is_first_page:
+            return result_items
+
+        deleted_items = [
+            self._reconstruct_display_item(m)
+            for m in self.get_messages()
+            if m.get("type") == msg_type
+            and m.get("is_deleted") is True
+            and str(m.get("id", "")) not in live_ids
+        ]
+        if not deleted_items:
+            return result_items
+
+        combined = result_items + deleted_items
+        if msg_type == "announcement":
+            top_items = [i for i in combined if i.get("is_top")]
+            non_top_items = [i for i in combined if not i.get("is_top")]
+            non_top_items.sort(key=lambda x: _safe_int(x.get("id")) or 0, reverse=True)
+            return top_items + non_top_items
+
+        combined.sort(key=lambda x: _safe_int(x.get("id")) or 0, reverse=True)
+        return combined
+
+    def get_stored_announcement_detail(
+        self, announcement_id: str, mark_deleted: bool = False
+    ) -> dict[str, Any] | None:
+        """
+        Retrieve an announcement from messages.json (fallback when recalled from SmartDaily).
+        """
+        store = self.get_message_store()
+        target_uid = f"announcement:{announcement_id}"
+        found = next((m for m in store["messages"] if m.get("uid") == target_uid), None)
+        if not found:
+            return None
+
+        if mark_deleted and not found.get("is_deleted"):
+            found["is_deleted"] = True
+            if isinstance(found.get("item"), dict):
+                found["item"]["is_deleted"] = True
+            self.save_message_store(store)
+
+        disp = self._reconstruct_display_item(found)
+        return {
+            "id": str(disp.get("id", announcement_id)),
+            "title": disp.get("title", ""),
+            "type_name": disp.get("type_name", "公告"),
+            "create_date": disp.get("create_date") or disp.get("start_date") or "",
+            "content": disp.get("content", ""),
+            "attachments": [],
+            "attachment_count": 0,
+            "is_deleted": bool(found.get("is_deleted", False)),
+        }
 
     def check_and_record_new_items(
         self,
@@ -471,7 +654,7 @@ class PushService:
                 continue
 
             if "pushed_message_uids" not in latest_sub:
-                latest_sub["pushed_message_uids"] = list(all_current_uids)[:MAX_DEVICE_PUSHED_UIDS]
+                latest_sub["pushed_message_uids"] = list(all_current_uids)
                 self.save_device_subscription(latest_sub)
 
             pushed_uids: list[str] = list(latest_sub.get("pushed_message_uids", []))
@@ -516,7 +699,7 @@ class PushService:
                         merged = list(
                             dict.fromkeys(list(reversed(newly_pushed_for_device)) + disk_uids)
                         )
-                        current_on_disk["pushed_message_uids"] = merged[:MAX_DEVICE_PUSHED_UIDS]
+                        current_on_disk["pushed_message_uids"] = merged
                         self.save_device_subscription(current_on_disk)
 
         return {

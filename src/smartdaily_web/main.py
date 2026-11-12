@@ -156,23 +156,50 @@ async def get_status() -> dict[str, Any]:
 @app.get("/api/announcements")
 async def list_announcements(offset: int = 0, max_count: int = 10) -> dict[str, Any]:
     try:
-        return await client.get_announcements(offset=offset, max_count=max_count)
+        data = await client.get_announcements(offset=offset, max_count=max_count)
+        data["items"] = push_service.merge_with_deleted_items(
+            "announcement",
+            data.get("items", []),
+            is_first_page=(offset == 0),
+        )
+        data["total_count"] = len(data["items"])
+        return data
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/announcements/{announcement_id}")
 async def get_announcement_detail(announcement_id: str) -> dict[str, Any]:
+    stored = push_service.get_stored_announcement_detail(announcement_id)
     try:
-        return await client.get_announcement_detail(announcement_id)
+        detail = await client.get_announcement_detail(announcement_id)
+        if not detail.get("title") and not detail.get("content") and stored:
+            return (
+                push_service.get_stored_announcement_detail(announcement_id, mark_deleted=True)
+                or stored
+            )
+        detail["is_deleted"] = bool(stored.get("is_deleted")) if stored else False
+        return detail
     except Exception as exc:
+        if stored:
+            return (
+                push_service.get_stored_announcement_detail(announcement_id, mark_deleted=True)
+                or stored
+            )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/notifications/personal")
 async def list_personal_notifications(offset: int = 0, max_count: int = 10) -> dict[str, Any]:
     try:
-        return await client.get_personal_notifications(offset=offset, max_count=max_count)
+        data = await client.get_personal_notifications(offset=offset, max_count=max_count)
+        data["items"] = push_service.merge_with_deleted_items(
+            "personal",
+            data.get("items", []),
+            is_first_page=(offset == 0),
+        )
+        data["total_count"] = len(data["items"])
+        return data
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -180,7 +207,14 @@ async def list_personal_notifications(offset: int = 0, max_count: int = 10) -> d
 @app.get("/api/notifications/reminders")
 async def list_reminders(before_datetime: str = "") -> dict[str, Any]:
     try:
-        return await client.get_my_reminders(before_datetime=before_datetime)
+        data = await client.get_my_reminders(before_datetime=before_datetime)
+        data["items"] = push_service.merge_with_deleted_items(
+            "reminder",
+            data.get("items", []),
+            is_first_page=(before_datetime == ""),
+        )
+        data["total_count"] = len(data["items"])
+        return data
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

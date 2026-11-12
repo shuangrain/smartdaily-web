@@ -179,6 +179,8 @@
     .badge-top { background: #f59e0b22; color: #fbbf24; border: 1px solid #f59e0b66; }
     .badge-type { background: #3b82f622; color: #60a5fa; border: 1px solid #3b82f655; }
     .badge-unread { background: #ef444422; color: #f87171; border: 1px solid #ef444466; }
+    .badge-deleted { background: #ef444433; color: #fca5a5; border: 1px solid #ef444488; }
+    .card.is-deleted { border-color: #ef444455; opacity: 0.88; }
     .card-title {
       font-size: 1rem;
       font-weight: 700;
@@ -465,12 +467,14 @@
       }
       items.forEach((ann) => {
         const card = document.createElement("div");
-        card.className = "card";
+        card.className = ann.is_deleted ? "card is-deleted" : "card";
+        const deletedBadge = ann.is_deleted ? `<span class="badge badge-deleted">🗑️ 已回收</span>` : "";
         const topBadge = ann.is_top ? `<span class="badge badge-top">📌 置頂</span>` : "";
         const typeBadge = `<span class="badge badge-type">${ann.type_name || "公告"}</span>`;
         const preview = ann.content || "（點擊查看附件或詳細內容）";
         card.innerHTML = `
           <div class="card-meta">
+            ${deletedBadge}
             ${topBadge}
             ${typeBadge}
             <span>📅 ${ann.start_date ? ann.start_date.slice(0, 10) : ann.create_date}</span>
@@ -500,8 +504,10 @@
       try {
         const res = await fetch(`/api/announcements/${encodeURIComponent(id)}`);
         const detail = await res.json();
+        const isDeleted = Boolean(detail.is_deleted || fallbackAnn?.is_deleted);
+        const deletedBadge = isDeleted ? `<span class="badge badge-deleted">🗑️ 已回收</span> ` : "";
         titleEl.textContent = detail.title || fallbackAnn?.title || "";
-        metaEl.innerHTML = `<span class="badge badge-type">${detail.type_name || "公告"}</span> <span>📅 ${detail.create_date || fallbackAnn?.start_date || ""}</span>`;
+        metaEl.innerHTML = `${deletedBadge}<span class="badge badge-type">${detail.type_name || "公告"}</span> <span>📅 ${detail.create_date || fallbackAnn?.start_date || ""}</span>`;
         contentEl.textContent = detail.content || fallbackAnn?.content || "（本公告無文字內文，請參閱下方附件）";
 
         if (detail.attachments && detail.attachments.length > 0) {
@@ -543,7 +549,8 @@
       }
       items.forEach((item) => {
         const card = document.createElement("div");
-        card.className = "card";
+        card.className = item.is_deleted ? "card is-deleted" : "card";
+        const deletedBadge = item.is_deleted ? `<span class="badge badge-deleted">🗑️ 已回收</span>` : "";
         let imagesHtml = "";
         if (item.files && item.files.length > 0) {
           imagesHtml = `<div class="notif-images">` +
@@ -552,6 +559,7 @@
         }
         card.innerHTML = `
           <div class="card-meta">
+            ${deletedBadge}
             <span class="badge badge-type">物管推播</span>
             <span>🕒 ${item.push_date}</span>
           </div>
@@ -579,12 +587,14 @@
       };
       items.forEach((item) => {
         const card = document.createElement("div");
-        card.className = "card";
+        card.className = item.is_deleted ? "card is-deleted" : "card";
+        const deletedBadge = item.is_deleted ? `<span class="badge badge-deleted">🗑️ 已回收</span>` : "";
         const tagLabel = featureLabels[item.feature_name] || item.feature_name || "提醒";
         const unreadBadge = !item.has_read ? `<span class="badge badge-unread">未讀</span>` : "";
         const localTime = item.pushing_time ? new Date(item.pushing_time).toLocaleString("zh-TW") : "";
         card.innerHTML = `
           <div class="card-meta">
+            ${deletedBadge}
             ${unreadBadge}
             <span class="badge badge-type">${tagLabel}</span>
             <span>🕒 ${localTime}</span>
