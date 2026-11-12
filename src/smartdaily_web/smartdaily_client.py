@@ -354,10 +354,13 @@ class SmartdailyClient:
             raw_notices = resp.json()
 
         items = []
+        has_cpn = False
         for n in raw_notices if isinstance(raw_notices, list) else []:
             msg = n.get("Message") or {}
             msg_data = msg.get("Data") or {}
             feature = msg_data.get("FeatureName", "")
+            if feature == "CommunityPushNotification":
+                has_cpn = True
             items.append(
                 {
                     "id": str(n.get("Id", "")),
@@ -370,6 +373,25 @@ class SmartdailyClient:
                     "files": n.get("Files") or [],
                 }
             )
+
+        # Enrich CommunityPushNotification reminders with image files from Notification/List
+        if has_cpn and not before_datetime:
+            try:
+                pers_data = await self.get_personal_notifications(offset=0, max_count=10)
+                files_by_id = {
+                    str(p["id"]): p["files"]
+                    for p in pers_data.get("items", [])
+                    if p.get("id") and p.get("files")
+                }
+                for it in items:
+                    if (
+                        it["feature_name"] == "CommunityPushNotification"
+                        and not it["files"]
+                        and it["target_id"] in files_by_id
+                    ):
+                        it["files"] = files_by_id[it["target_id"]]
+            except Exception as exc:
+                logger.debug("Could not enrich reminder files from personal notifications: %s", exc)
 
         return {
             "has_more": len(items) >= 10,

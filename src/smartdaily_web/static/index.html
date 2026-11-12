@@ -631,7 +631,10 @@
             `<div class="notif-images">` +
             item.files
               .filter((f) => f.Url || f.url)
-              .map((f) => `<img src="${f.Url || f.url}" alt="附件圖片" loading="lazy" />`)
+              .map((f) => {
+                const imgUrl = escapeHtml(f.Url || f.url);
+                return `<a href="${imgUrl}" target="_blank" rel="noopener"><img src="${imgUrl}" alt="附件圖片" loading="lazy" /></a>`;
+              })
               .join("") +
             `</div>`;
         }

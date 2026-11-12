@@ -48,6 +48,26 @@ def _safe_int(val: Any) -> int | None:
         return None
 
 
+def _parse_iso_ts(val: Any) -> float | None:
+    s = str(val or "").strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        if "." in s:
+            head, tail = s.split(".", 1)
+            tz_sep = "+" if "+" in tail else ("-" if "-" in tail else "")
+            if tz_sep:
+                frac, tz = tail.split(tz_sep, 1)
+                s = f"{head}.{frac[:6].ljust(6, '0')}{tz_sep}{tz}"
+            else:
+                s = f"{head}.{tail[:6].ljust(6, '0')}"
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return None
+
+
 def _atomic_write_json(path: Path, data: Any) -> None:
     """Atomically write JSON data to path via a temporary file rename."""
     tmp_path = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}")
@@ -451,7 +471,7 @@ class PushService:
         live_by_id = {str(it.get("id", "")): it for it in live_items if it.get("id")}
         has_more_pages = len(live_items) >= page_size
 
-        # Compute minimum numeric ID on the current top page to distinguish pagination vs deletion
+        # Compute minimum numeric ID or timestamp on current top page to distinguish pagination
         if msg_type == "announcement":
             non_top_ids = [
                 _safe_int(it.get("id"))
@@ -462,11 +482,18 @@ class PushService:
                 _safe_int(it.get("id")) for it in live_items if _safe_int(it.get("id")) is not None
             ]
             cutoff_int_id = min(non_top_ids) if non_top_ids else (min(all_ids) if all_ids else None)
+            cutoff_ts = None
         else:
             all_ids = [
                 _safe_int(it.get("id")) for it in live_items if _safe_int(it.get("id")) is not None
             ]
             cutoff_int_id = min(all_ids) if all_ids else None
+            all_ts = [
+                _parse_iso_ts(it.get("pushing_time"))
+                for it in live_items
+                if _parse_iso_ts(it.get("pushing_time")) is not None
+            ]
+            cutoff_ts = min(all_ts) if all_ts else None
 
         for msg in existing_messages:
             if msg.get("type") != msg_type:
@@ -474,21 +501,31 @@ class PushService:
             mid = str(msg.get("id", ""))
             if mid in live_by_id:
                 msg["is_deleted"] = False
-                old_content = (
-                    msg["item"].get("content", "") if isinstance(msg.get("item"), dict) else ""
-                )
+                old_item = msg["item"] if isinstance(msg.get("item"), dict) else {}
+                old_content = old_item.get("content", "")
+                old_files = old_item.get("files", [])
                 item_copy = dict(live_by_id[mid])
                 if not item_copy.get("content") and old_content:
                     item_copy["content"] = old_content
+                if not item_copy.get("files") and old_files:
+                    item_copy["files"] = old_files
                 item_copy["is_deleted"] = False
                 msg["item"] = item_copy
             else:
                 msg.setdefault("is_deleted", False)
                 if not has_more_pages:
                     msg["is_deleted"] = True
-                elif cutoff_int_id is not None:
+                else:
                     stored_int_id = _safe_int(mid)
-                    if stored_int_id is not None and stored_int_id >= cutoff_int_id:
+                    stored_item = msg.get("item") if isinstance(msg.get("item"), dict) else {}
+                    stored_ts = _parse_iso_ts(stored_item.get("pushing_time"))
+                    if (
+                        cutoff_int_id is not None
+                        and stored_int_id is not None
+                        and stored_int_id >= cutoff_int_id
+                    ):
+                        msg["is_deleted"] = True
+                    elif cutoff_ts is not None and stored_ts is not None and stored_ts >= cutoff_ts:
                         msg["is_deleted"] = True
                 if isinstance(msg.get("item"), dict):
                     msg["item"]["is_deleted"] = bool(msg["is_deleted"])
@@ -625,7 +662,13 @@ class PushService:
             non_top_items.sort(key=lambda x: _safe_int(x.get("id")) or 0, reverse=True)
             return top_items + non_top_items
 
-        combined.sort(key=lambda x: _safe_int(x.get("id")) or 0, reverse=True)
+        combined.sort(
+            key=lambda x: (
+                _parse_iso_ts(x.get("pushing_time")) or 0.0,
+                _safe_int(x.get("id")) or 0,
+            ),
+            reverse=True,
+        )
         return combined
 
     def get_uncached_announcement_ids(self) -> list[str]:
