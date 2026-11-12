@@ -1,4 +1,4 @@
-# 智生活社區公告與我的提醒 Web (`smartdaily-web`)
+# smartdaily-web
 
 [![CI Checks](https://github.com/shuangrain/smartdaily-web/actions/workflows/ci.yml/badge.svg)](https://github.com/shuangrain/smartdaily-web/actions/workflows/ci.yml)
 [![GitHub Release](https://img.shields.io/github/v/release/shuangrain/smartdaily-web?color=blue)](https://github.com/shuangrain/smartdaily-web/releases)
@@ -6,7 +6,9 @@
 
 提供手機、平板與電腦使用的社區公告與提醒服務，也支援 iPhone 和 iPad 加入主畫面後接收通知。
 
-公告與提醒會定時更新，網頁顯示已保存的內容。按「立即檢查新訊息」會開始更新；如果正在更新，就不會重複開始。
+公告與提醒會定時更新，網頁顯示已保存的內容。按「⚡ 立即更新」會檢查新訊息，完成後重新載入目前頁面。
+
+若已有舊版公告、提醒或裝置設定，首次啟動時會自動沿用，原有資料檔也會保留。
 
 1. **📢 社區公告**：公告內文與 PDF、圖片附件會保存下來。即使公告之後被社區撤下，已保存的內容仍可查看。
 2. **📬 我的提醒**：查看包裹、寄放物、社區公告、個人通知與其他提醒，也可以按類型篩選。
@@ -86,6 +88,7 @@ services:
     environment:
       - DEVICE_ID=您的DeviceID
       - POLL_INTERVAL_SECONDS=180
+      - FULL_SYNC_INTERVAL_SECONDS=86400
       - LOG_LEVEL=INFO
     volumes:
       - ./data:/app/data
@@ -96,6 +99,8 @@ services:
 ```bash
 docker compose up -d
 ```
+
+系統預設每 3 分鐘查看最新訊息，並每 24 小時重新檢查所有公告與提醒。若要調整完整檢查的間隔，可設定 `FULL_SYNC_INTERVAL_SECONDS`，單位為秒（例如 `43200` 代表 12 小時）。
 
 ---
 

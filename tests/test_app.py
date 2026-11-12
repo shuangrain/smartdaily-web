@@ -28,7 +28,291 @@ def test_clean_html_text():
     assert "<p>" not in cleaned
 
 
+def test_sqlite_migrates_legacy_messages_and_devices_once(tmp_path: Path):
+    import json
+    import sqlite3
+
+    devices_dir = tmp_path / "devices"
+    devices_dir.mkdir()
+    messages_path = tmp_path / "messages.json"
+    legacy_reminder = {
+        "uid": "reminder:r-legacy",
+        "type": "reminder",
+        "id": "r-legacy",
+        "title": "📦 [郵務包裹] 舊包裹提醒",
+        "body": "包裹已送達",
+        "url": "/?tab=reminders",
+        "tag": "rem-r-legacy",
+        "discovered_at": "2026-11-10T10:00:00+00:00",
+        "is_deleted": False,
+        "item": {
+            "id": "r-legacy",
+            "pushing_time": "2026-11-10T09:00:00Z",
+            "has_read": False,
+            "title": "舊包裹提醒",
+            "body": "包裹已送達",
+            "feature_name": "postal",
+            "target_id": "",
+            "files": [],
+            "is_deleted": False,
+        },
+    }
+    messages_path.write_text(
+        json.dumps(
+            {
+                "initialized_types": ["reminder"],
+                "messages": [legacy_reminder],
+                "metadata": {
+                    "community_name": "測試社區",
+                    "com_id": "123",
+                    "last_full_sync_at": "2026-11-10T10:00:00+00:00",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    legacy_device = {
+        "device_id": "legacy-device",
+        "endpoint": "https://web.push.apple.com/legacy-device",
+        "keys": {"p256dh": "key", "auth": "secret"},
+        "user_agent": "test device",
+        "subscribed_at": "2026-11-10T08:00:00+00:00",
+        "pushed_message_uids": ["reminder:r-legacy"],
+    }
+    device_path = devices_dir / "legacy-device.json"
+    device_path.write_text(json.dumps(legacy_device), encoding="utf-8")
+
+    svc = PushService(data_dir=tmp_path)
+
+    assert svc.database_file.is_file()
+    assert svc.get_store_metadata()["community_name"] == "測試社區"
+    assert svc.get_store_metadata()["last_full_sync_at"] == "2026-11-10T10:00:00+00:00"
+    assert [message["uid"] for message in svc.get_messages()] == ["reminder:r-legacy"]
+    assert svc.get_subscriptions()[0]["pushed_message_uids"] == ["reminder:r-legacy"]
+    assert messages_path.is_file()
+    assert device_path.is_file()
+
+    svc = PushService(data_dir=tmp_path)
+    assert [message["uid"] for message in svc.get_messages()] == ["reminder:r-legacy"]
+    with sqlite3.connect(svc.database_file) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM push_deliveries").fetchone()[0] == 1
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] >= 2
+
+
+def test_sqlite_baselines_legacy_device_without_delivery_history(tmp_path: Path):
+    import json
+
+    messages_path = tmp_path / "messages.json"
+    messages_path.write_text(
+        json.dumps(
+            {
+                "initialized_types": ["reminder"],
+                "messages": [
+                    {
+                        "uid": "reminder:r-old",
+                        "type": "reminder",
+                        "id": "r-old",
+                        "discovered_at": "2026-11-10T10:00:00Z",
+                        "item": {
+                            "id": "r-old",
+                            "pushing_time": "2026-11-10T09:00:00Z",
+                            "feature_name": "postal",
+                            "title": "舊提醒",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    devices_dir = tmp_path / "devices"
+    devices_dir.mkdir()
+    (devices_dir / "legacy-device.json").write_text(
+        json.dumps(
+            {
+                "device_id": "legacy-device",
+                "endpoint": "https://web.push.apple.com/legacy-without-delivery-history",
+                "keys": {"p256dh": "key", "auth": "secret"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    svc = PushService(data_dir=tmp_path)
+
+    assert svc.get_subscriptions()[0]["pushed_message_uids"] == ["reminder:r-old"]
+
+
+def test_sqlite_round_trips_typed_messages_and_attachments(tmp_path: Path):
+    svc = PushService(data_dir=tmp_path)
+    archive_attachment = {"name": "notice.pdf", "local_url": "/api/attachments/a-1/notice.pdf"}
+    source_attachment = {"url": "https://example.test/photo.jpg", "mime_type": "image/jpeg"}
+    messages = [
+        {
+            "uid": "announcement:a-1",
+            "type": "announcement",
+            "id": "a-1",
+            "discovered_at": "2026-11-10T10:00:00Z",
+            "is_deleted": False,
+            "attachments_cached": True,
+            "attachments": [archive_attachment],
+            "item": {
+                "id": "a-1",
+                "com_id": "community-1",
+                "title": "社區公告",
+                "content": "公告內容",
+                "is_top": False,
+                "files": [source_attachment],
+                "is_deleted": False,
+            },
+        },
+        {
+            "uid": "reminder:r-1",
+            "type": "reminder",
+            "id": "r-1",
+            "discovered_at": "2026-11-10T10:01:00Z",
+            "is_deleted": False,
+            "item": {
+                "id": "r-1",
+                "title": "提醒標題",
+                "body": "提醒內容",
+                "feature_name": "postal",
+                "files": [source_attachment],
+            },
+        },
+        {
+            "uid": "personal:p-1",
+            "type": "personal",
+            "id": "p-1",
+            "discovered_at": "2026-11-10T10:02:00Z",
+            "is_deleted": False,
+            "item": {
+                "id": "p-1",
+                "community": "測試社區",
+                "content": "個人通知內容",
+                "push_date": "2026-11-10T10:02:00Z",
+            },
+        },
+    ]
+    svc.save_message_store(
+        {
+            "initialized_types": ["announcement", "reminder", "personal"],
+            "messages": messages,
+            "metadata": {},
+        }
+    )
+
+    stored = {message["uid"]: message for message in svc.database.load_message_store()["messages"]}
+    announcement = stored["announcement:a-1"]
+    assert announcement["item"]["com_id"] == "community-1"
+    assert announcement["item"]["files"] == [source_attachment]
+    assert announcement["attachments"] == [archive_attachment]
+    assert announcement["attachments_cached"] is True
+    assert stored["reminder:r-1"]["item"]["pushing_time"] == ""
+    assert stored["reminder:r-1"]["item"]["files"] == [source_attachment]
+    assert stored["personal:p-1"]["item"]["content"] == "個人通知內容"
+
+
+def test_sqlite_preserves_message_order_after_incremental_sync(tmp_path: Path):
+    svc = PushService(data_dir=tmp_path)
+    svc.sync_messages(
+        reminders=[
+            {
+                "id": "r-old",
+                "pushing_time": "2026-11-10T10:00:00Z",
+                "feature_name": "postal",
+                "title": "舊提醒",
+            }
+        ]
+    )
+    svc.sync_messages(
+        reminders=[
+            {
+                "id": "r-new",
+                "pushing_time": "2026-11-10T10:01:00Z",
+                "feature_name": "postal",
+                "title": "新提醒",
+            },
+            {
+                "id": "r-old",
+                "pushing_time": "2026-11-10T10:00:00Z",
+                "feature_name": "postal",
+                "title": "舊提醒",
+            },
+        ]
+    )
+
+    assert [message["id"] for message in svc.get_messages()] == ["r-new", "r-old"]
+
+
+def test_sqlite_schema_migration_rolls_back_and_can_retry(tmp_path: Path):
+    import sqlite3
+
+    import pytest
+
+    from smartdaily_web.database import SQLiteStore
+
+    store = SQLiteStore(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(store.database_file) as connection:
+        connection.execute("CREATE TABLE announcements (unexpected_column TEXT)")
+
+    with pytest.raises(sqlite3.OperationalError):
+        store.migrate()
+
+    with sqlite3.connect(store.database_file) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    assert "messages" not in tables
+    assert "announcements" in tables
+
+    with sqlite3.connect(store.database_file) as connection:
+        connection.execute("DROP TABLE announcements")
+    store.migrate()
+
+    with sqlite3.connect(store.database_file) as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM sync_state").fetchone()[0] == 1
+
+
+def test_app_lifespan_runs_migrations_before_starting_background_poll(monkeypatch):
+    import asyncio
+    import importlib
+
+    main_mod = importlib.import_module("smartdaily_web.main")
+    calls: list[str] = []
+    monkeypatch.delenv("DISABLE_BACKGROUND_POLL", raising=False)
+
+    async def fake_background_poll_loop():
+        return None
+
+    class FakeTask:
+        def cancel(self):
+            calls.append("cancel")
+
+    def fake_create_task(coro):
+        calls.append("start_poll")
+        coro.close()
+        return FakeTask()
+
+    monkeypatch.setattr(main_mod.push_service, "migrate", lambda: calls.append("migrate"))
+    monkeypatch.setattr(main_mod, "background_poll_loop", fake_background_poll_loop)
+    monkeypatch.setattr(main_mod.asyncio, "create_task", fake_create_task)
+
+    async def scenario():
+        async with main_mod.lifespan(main_mod.app):
+            assert calls == ["migrate", "start_poll"]
+        assert calls == ["migrate", "start_poll", "cancel"]
+
+    asyncio.run(scenario())
+
+
 def test_push_service_vapid_and_per_device_push_tracking(tmp_path: Path, monkeypatch):
+    import sqlite3
+
     svc = PushService(data_dir=tmp_path)
     assert len(svc.public_key) > 40
     assert len(svc.private_key) > 20
@@ -55,7 +339,7 @@ def test_push_service_vapid_and_per_device_push_tracking(tmp_path: Path, monkeyp
         "reminder:300",
     }
 
-    # Subscribe Device B after baseline is already in messages.json
+    # Subscribe Device B after its baseline is already stored in SQLite
     sub_b = {
         "endpoint": "https://web.push.apple.com/device-b",
         "keys": {"p256dh": "kb", "auth": "ab"},
@@ -63,13 +347,10 @@ def test_push_service_vapid_and_per_device_push_tracking(tmp_path: Path, monkeyp
     svc.add_subscription(sub_b, user_agent="iPad-B")
     subs_with_b = svc.get_subscriptions()
     dev_b = next(s for s in subs_with_b if s["endpoint"] == sub_b["endpoint"])
-    assert set(dev_b["pushed_message_uids"]) == {
-        "announcement:100",
-        "reminder:300",
-    }
+    assert dev_b["pushed_message_uids"] == []
 
     # Second run: new announcement & 2 new reminders arrive
-    # Announcements are stored for display/backup; reminders trigger Web Push with [類型] prefix
+    # Announcements are stored for display/backup; reminder pushes put the category emoji first.
     events2 = svc.sync_messages(
         announcements=[
             {"id": "101", "title": "新公告", "content": "新內容"},
@@ -93,9 +374,9 @@ def test_push_service_vapid_and_per_device_push_tracking(tmp_path: Path, monkeyp
         ],
     )
     assert len(events2) == 2
-    assert events2[0]["title"] == "[📦 郵務包裹] 包裹到件通知"
+    assert events2[0]["title"] == "📦 [郵務包裹] 包裹到件通知"
     assert events2[0]["url"] == "/?tab=reminders"
-    assert events2[1]["title"] == "[📢 社區公告] 新公告通知"
+    assert events2[1]["title"] == "📢 [社區公告] 新公告通知"
     assert events2[1]["url"] == "/?tab=announcements&id=101"
     assert len(svc.get_messages()) == 5
 
@@ -121,6 +402,29 @@ def test_push_service_vapid_and_per_device_push_tracking(tmp_path: Path, monkeyp
     assert "reminder:302" in dev_a_state["pushed_message_uids"]
     assert "reminder:301" not in dev_b_state["pushed_message_uids"]
     assert "reminder:302" in dev_b_state["pushed_message_uids"]
+    with sqlite3.connect(svc.database_file) as connection:
+        delivery = connection.execute(
+            """
+            SELECT d.status, d.attempts FROM push_deliveries d
+            JOIN devices ON devices.device_id=d.device_id
+            JOIN messages ON messages.message_id=d.message_id
+            WHERE devices.endpoint=? AND messages.external_id='301'
+            """,
+            (sub_b["endpoint"],),
+        ).fetchone()
+    assert delivery == ("failed", 1)
+    svc.save_device_subscription(dev_a_state)
+    with sqlite3.connect(svc.database_file) as connection:
+        delivery = connection.execute(
+            """
+            SELECT d.status, d.attempts FROM push_deliveries d
+            JOIN devices ON devices.device_id=d.device_id
+            JOIN messages ON messages.message_id=d.message_id
+            WHERE devices.endpoint=? AND messages.external_id='301'
+            """,
+            (sub_a["endpoint"],),
+        ).fetchone()
+    assert delivery == ("sent", 1)
 
     # Next push cycle: Device A gets 0 pushes, Device B retries ONLY reminder:301 and succeeds
     delivery_log.clear()
@@ -133,6 +437,18 @@ def test_push_service_vapid_and_per_device_push_tracking(tmp_path: Path, monkeyp
     assert res2["sent"] == 1
     assert res2["failed"] == 0
     assert delivery_log == [(sub_b["endpoint"], "reminder:301")]
+    with sqlite3.connect(svc.database_file) as connection:
+        delivery = connection.execute(
+            """
+            SELECT d.status, d.attempts, d.sent_at FROM push_deliveries d
+            JOIN devices ON devices.device_id=d.device_id
+            JOIN messages ON messages.message_id=d.message_id
+            WHERE devices.endpoint=? AND messages.external_id='301'
+            """,
+            (sub_b["endpoint"],),
+        ).fetchone()
+    assert delivery[0:2] == ("sent", 2)
+    assert delivery[2]
 
 
 def test_push_subscribe_and_unsubscribe(tmp_path: Path):
@@ -147,11 +463,11 @@ def test_push_subscribe_and_unsubscribe(tmp_path: Path):
     }
     assert svc.add_subscription(sub1, user_agent="iPhone") == 1
     assert svc.add_subscription(sub2, user_agent="iPad") == 2
-    assert len(list((tmp_path / "devices").glob("*.json"))) == 2
+    assert len(svc.get_subscriptions()) == 2
     assert svc.remove_subscription("https://web.push.apple.com/test-endpoint-1") == 1
-    assert len(list((tmp_path / "devices").glob("*.json"))) == 1
+    assert len(svc.get_subscriptions()) == 1
     assert svc.remove_subscription("https://web.push.apple.com/test-endpoint-2") == 0
-    assert len(list((tmp_path / "devices").glob("*.json"))) == 0
+    assert svc.get_subscriptions() == []
 
 
 def test_old_reminder_backfill_is_baselined_and_only_newer_item_is_pushed(
@@ -224,7 +540,7 @@ def test_device_create_time_blocks_older_reminders_even_if_uid_is_missing(
         }
     )
 
-    # Simulate an older device JSON that has a create_time field and a missing UID record.
+    # Simulate an older device record with a create_time field and missing UID data.
     device = svc.get_subscriptions()[0]
     device.pop("subscribed_at")
     device["create_time"] = "2026-11-10T10:00:00Z"
@@ -252,9 +568,41 @@ def test_device_create_time_blocks_older_reminders_even_if_uid_is_missing(
     assert delivered == ["reminder:r-after-device"]
 
 
-def test_message_json_metadata_and_local_pagination(tmp_path: Path):
-    import json
+def test_new_subscription_baselines_only_messages_without_discovery_time(tmp_path: Path):
+    svc = PushService(data_dir=tmp_path)
+    svc.sync_messages(
+        reminders=[
+            {
+                "id": "known-time",
+                "pushing_time": "2026-11-10T10:00:00Z",
+                "feature_name": "postal",
+                "title": "可判斷時間的提醒",
+            },
+            {
+                "id": "legacy-time",
+                "pushing_time": "2026-11-10T10:00:00Z",
+                "feature_name": "postal",
+                "title": "舊格式提醒",
+            },
+        ]
+    )
+    store = svc.get_message_store()
+    legacy_message = next(msg for msg in store["messages"] if msg["id"] == "legacy-time")
+    legacy_message.pop("discovered_at")
+    svc.save_message_store(store)
 
+    svc.add_subscription(
+        {
+            "endpoint": "https://web.push.apple.com/partial-baseline-device",
+            "keys": {"p256dh": "key", "auth": "auth"},
+        }
+    )
+
+    device = svc.get_subscriptions()[0]
+    assert device["pushed_message_uids"] == ["reminder:legacy-time"]
+
+
+def test_sqlite_metadata_and_local_pagination(tmp_path: Path):
     svc = PushService(data_dir=tmp_path)
     svc.sync_messages(
         announcements=[
@@ -272,7 +620,7 @@ def test_message_json_metadata_and_local_pagination(tmp_path: Path):
     first_page, total = svc.get_message_page("announcement", offset=0, max_count=2)
     second_page, _ = svc.get_message_page("announcement", offset=2, max_count=2)
     reminder_page, reminder_total = svc.get_message_page("reminder", offset=0, max_count=10)
-    saved = json.loads(svc.messages_file.read_text(encoding="utf-8"))
+    saved = svc.get_message_store()
 
     assert [item["id"] for item in first_page] == ["3", "2"]
     assert [item["id"] for item in second_page] == ["1"]
@@ -538,7 +886,7 @@ def test_legacy_subscription_migration_and_expired_device_cleanup(tmp_path: Path
     )
 
     svc = PushService(data_dir=tmp_path)
-    assert not legacy_file.exists()
+    assert legacy_file.exists()
     subs = svc.get_subscriptions()
     assert len(subs) == 2
 
@@ -648,6 +996,155 @@ def test_reminder_iso_timestamp_pagination_cutoff_and_recall_detection(tmp_path:
     assert "uuid-01" not in merged_ids
 
 
+def test_partial_sync_with_short_page_keeps_older_reminders_active(tmp_path: Path):
+    svc = PushService(data_dir=tmp_path)
+    svc.sync_messages(
+        reminders=[
+            {
+                "id": "old",
+                "pushing_time": "2026-11-10T10:00:00Z",
+                "feature_name": "postal",
+                "title": "舊提醒",
+            }
+        ]
+    )
+
+    svc.sync_messages(
+        reminders=[
+            {
+                "id": "new",
+                "pushing_time": "2026-11-10T10:01:00Z",
+                "feature_name": "postal",
+                "title": "新提醒",
+            }
+        ],
+        full_sync=False,
+    )
+
+    by_id = {message["id"]: message for message in svc.get_messages()}
+    assert by_id["old"]["is_deleted"] is False
+
+
+def test_poll_once_uses_incremental_pages_until_full_sync_interval(tmp_path: Path, monkeypatch):
+    import asyncio
+    import importlib
+    from datetime import datetime, timedelta, timezone
+
+    main_mod = importlib.import_module("smartdaily_web.main")
+    svc = PushService(data_dir=tmp_path)
+    monkeypatch.setattr(main_mod, "push_service", svc)
+    monkeypatch.setattr(main_mod, "poll_lock", asyncio.Lock())
+    monkeypatch.setattr(main_mod, "FULL_SYNC_INTERVAL_SECONDS", 86400, raising=False)
+    monkeypatch.setattr(
+        main_mod,
+        "poll_status",
+        {
+            "last_poll_at": None,
+            "last_trace_id": None,
+            "last_error": None,
+            "is_running": False,
+            "poll_interval_seconds": 180,
+        },
+    )
+
+    last_full_sync = datetime(2026, 11, 12, tzinfo=timezone.utc)
+    current_time = [last_full_sync + timedelta(hours=23, minutes=59)]
+    monkeypatch.setattr(main_mod, "_utc_now", lambda: current_time[0], raising=False)
+    svc.sync_messages(
+        announcements=[
+            {"id": "99", "title": "較舊公告"},
+            {"id": "100", "title": "既有公告"},
+        ],
+        reminders=[
+            {
+                "id": "r-1",
+                "pushing_time": "2026-11-12T09:00:00Z",
+                "feature_name": "postal",
+                "title": "既有提醒",
+            }
+        ],
+        full_sync=True,
+    )
+    svc.update_store_metadata(last_full_sync_at=last_full_sync.isoformat())
+
+    announcement_offsets: list[int] = []
+    reminder_cursors: list[str] = []
+    full_sync_values: list[bool] = []
+    original_sync_messages = svc.sync_messages
+
+    def record_sync_messages(*args, **kwargs):
+        full_sync_values.append(kwargs.get("full_sync", False))
+        return original_sync_messages(*args, **kwargs)
+
+    monkeypatch.setattr(svc, "sync_messages", record_sync_messages)
+
+    async def fake_get_announcements(offset: int = 0, max_count: int = 10):
+        announcement_offsets.append(offset)
+        if offset == 0:
+            return {
+                "community_name": "測試社區",
+                "com_id": "123",
+                "has_more": True,
+                "items": [
+                    {"id": "101", "title": "新公告"},
+                    {"id": "100", "title": "既有公告"},
+                ],
+            }
+        return {"has_more": False, "items": []}
+
+    async def fake_get_reminders(before_datetime: str = ""):
+        reminder_cursors.append(before_datetime)
+        if not before_datetime:
+            return {
+                "has_more": True,
+                "next_before_datetime": "2026-11-12T10:00:00Z",
+                "items": [
+                    {
+                        "id": "r-2",
+                        "pushing_time": "2026-11-12T10:00:00Z",
+                        "feature_name": "postal",
+                        "title": "新提醒",
+                    }
+                ],
+            }
+        return {
+            "has_more": False,
+            "items": [
+                {
+                    "id": "r-1",
+                    "pushing_time": "2026-11-12T09:00:00Z",
+                    "feature_name": "postal",
+                    "title": "既有提醒",
+                }
+            ],
+        }
+
+    async def fake_cache_attachments(_announcement_id: str):
+        return None
+
+    monkeypatch.setattr(main_mod.client, "get_announcements", fake_get_announcements)
+    monkeypatch.setattr(main_mod.client, "get_my_reminders", fake_get_reminders)
+    monkeypatch.setattr(main_mod, "ensure_announcement_attachments_cached", fake_cache_attachments)
+
+    async def run_incremental_then_full_sync():
+        incremental_result = await main_mod.poll_once()
+        current_time[0] = last_full_sync + timedelta(days=1)
+        full_result = await main_mod.poll_once()
+        return incremental_result, full_result
+
+    incremental_result, full_result = asyncio.run(run_incremental_then_full_sync())
+
+    assert incremental_result["new_events_count"] == 1
+    assert full_result["new_events_count"] == 0
+    assert announcement_offsets == [0, 0, 10]
+    assert reminder_cursors == ["", "", "2026-11-12T10:00:00Z"]
+    assert full_sync_values == [False, True]
+    assert svc.get_store_metadata()["last_full_sync_at"] == current_time[0].isoformat()
+    by_uid = {message["uid"]: message for message in svc.get_messages()}
+    assert by_uid["announcement:99"]["is_deleted"] is True
+    assert by_uid["reminder:r-1"]["is_deleted"] is False
+
+
 def test_smartdaily_client_pagination_404_detail_and_reminder_files(monkeypatch):
     import asyncio
 
@@ -754,7 +1251,9 @@ def test_smartdaily_client_pagination_404_detail_and_reminder_files(monkeypatch)
     ]
 
 
-def test_fastapi_announcement_detail_reads_local_json_and_guards_paths(tmp_path: Path, monkeypatch):
+def test_fastapi_announcement_detail_reads_local_store_and_guards_paths(
+    tmp_path: Path, monkeypatch
+):
     import asyncio
     import importlib
 
@@ -792,7 +1291,7 @@ def test_fastapi_announcement_detail_reads_local_json_and_guards_paths(tmp_path:
     )
     svc.sync_messages(announcements=[], full_sync=True)
 
-    # Announcement detail and recalled state come from the local JSON archive.
+    # Announcement detail and recalled state come from the local SQLite archive.
     res_backed_up = asyncio.run(main_mod.get_announcement_detail("101"))
     assert res_backed_up["is_deleted"] is True
     assert res_backed_up["title"] == "本地已備份公告"
@@ -803,9 +1302,39 @@ def test_fastapi_announcement_detail_reads_local_json_and_guards_paths(tmp_path:
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(main_mod.get_announcement_detail("2610272893"))
     assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "本機尚未收錄此公告"
 
 
-def test_frontend_data_endpoints_and_test_push_use_local_json(tmp_path: Path, monkeypatch):
+def test_fastapi_announcement_detail_uses_linked_reminder_when_local_copy_is_missing(
+    tmp_path: Path, monkeypatch
+):
+    import asyncio
+    import importlib
+
+    main_mod = importlib.import_module("smartdaily_web.main")
+    svc = PushService(data_dir=tmp_path)
+    monkeypatch.setattr(main_mod, "push_service", svc)
+    svc.sync_messages(
+        reminders=[
+            {
+                "id": "r-101",
+                "pushing_time": "2026-11-10T10:00:00Z",
+                "feature_name": "Ann",
+                "target_id": "101",
+                "title": "社區公告通知",
+                "body": "公告摘要內容",
+            }
+        ]
+    )
+
+    detail = asyncio.run(main_mod.get_announcement_detail("101"))
+
+    assert detail["detail_unavailable"] is True
+    assert detail["title"] == "社區公告通知"
+    assert detail["content"] == "公告摘要內容"
+
+
+def test_frontend_data_endpoints_and_test_push_use_local_database(tmp_path: Path, monkeypatch):
     import asyncio
     import importlib
 
@@ -855,7 +1384,7 @@ def test_frontend_data_endpoints_and_test_push_use_local_json(tmp_path: Path, mo
     assert reminder_page["items"][0]["id"] == "r-1"
     assert detail["content"] == "公告內容"
     assert test_result["body"] == "📢 最新公告：本地公告\n📬 最新提醒：有一件包裹..."
-    assert pushed["title"].startswith("[🔔 推播測試] 本地社區")
+    assert pushed["title"].startswith("🔔 [推播測試] 本地社區")
 
 
 def test_background_detail_fetch_marks_recalled_announcement(tmp_path: Path, monkeypatch):
@@ -901,6 +1430,15 @@ def test_frontend_ui_conventions_tabs_filters_infinite_scroll_and_emoji_spacing(
     assert 'id="loadMoreBtn"' not in html_text
     assert "fetch(`/api/announcements?offset=${currentOffset}&max_count=10`)" in html_text
     assert "fetch(`/api/notifications/reminders?offset=${currentOffset}&max_count=10`)" in html_text
+    assert "detail.detail_unavailable" in html_text
+    assert 'id="refreshBtn"' in html_text
+    assert ">⚡ 立即更新</button>" in html_text
+    assert 'id="pollNowBtn"' not in html_text
+    assert "立即檢查新訊息" not in html_text
+    refresh_handler = html_text.split(
+        'document.getElementById("refreshBtn").addEventListener("click", async () => {'
+    )[1].split("    });", 1)[0]
+    assert 'fetch("/api/poll-now", { method: "POST" })' in refresh_handler
 
     # 4. Emoji spacing: strictly 1 half-width space in '🗑️ 已回收', never double-space or zero-space
     assert "🗑️ 已回收" in html_text

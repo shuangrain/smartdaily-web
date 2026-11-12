@@ -3,9 +3,9 @@
 ## Project Structure & Module Organization
 
 - `src/smartdaily_web/main.py` defines the FastAPI app and background polling workflow.
-- `smartdaily_client.py` handles SmartDaily requests and response normalization; `push_service.py` manages local message JSON, device subscriptions, and Web Push delivery.
+- `smartdaily_client.py` handles SmartDaily requests and response normalization; `push_service.py` manages local records and Web Push delivery, while `database.py` defines the SQLite schema and migrations.
 - `src/smartdaily_web/static/` contains the HTML, service worker, manifest, and icons.
-- `tests/test_app.py` contains the pytest suite. Runtime files such as message stores, device state, VAPID keys, and downloaded attachments belong under `data/`, not in source control.
+- `tests/test_app.py` contains the pytest suite. Runtime files such as the SQLite database, VAPID keys, and downloaded attachments belong under `data/`, not in source control. Legacy message and device JSON files are imported on the first database migration and retained as backups.
 
 ## Build, Test, and Development Commands
 
@@ -21,7 +21,7 @@ Use Python 3.10+, four-space indentation, and the Ruff settings in `pyproject.to
 
 ## Testing Guidelines
 
-Use pytest with `tmp_path` for filesystem state and `monkeypatch` for external clients and push delivery. Keep tests deterministic and independent of a real SmartDaily account or network access. Cover pagination, per-device delivery/retry behavior, and JSON-backed routes when changing those paths.
+Use pytest with `tmp_path` for filesystem state and `monkeypatch` for external clients and push delivery. Keep tests deterministic and independent of a real SmartDaily account or network access. Cover pagination, per-device delivery/retry behavior, and SQLite reads/writes when changing those paths. Add a migration test whenever the schema or legacy import changes.
 
 For behavior changes, use red-green-refactor: add one focused test at a public behavior boundary, run it and confirm the expected failure, then make the smallest implementation that passes. Run the focused test and full suite before refactoring; rerun affected checks afterward. Documentation-only and formatting-only changes use their relevant checks, such as Ruff format, without adding behavior tests.
 
@@ -31,4 +31,4 @@ Recent commits use short Conventional Commit prefixes such as `feat:`, `fix:`, `
 
 ## Security & Architecture Notes
 
-Only the background poller should call SmartDaily APIs; web routes and the frontend read locally stored data. Keep `DEVICE_ID`, VAPID secrets, and other credentials in environment configuration, never in commits. Do not commit runtime data or downloaded resident documents.
+Only the background poller should call SmartDaily APIs; web routes and the frontend read locally stored data. Define schema changes as versioned migrations in `src/smartdaily_web/database.py`; startup applies pending migrations before starting the poller. Keep `DEVICE_ID`, VAPID secrets, and other credentials in environment configuration, never in commits. Do not commit runtime data or downloaded resident documents.

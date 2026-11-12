@@ -8,7 +8,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +49,7 @@ logger.setLevel(LOG_LEVEL)
 
 STATIC_DIR = Path(__file__).parent / "static"
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "180"))
+FULL_SYNC_INTERVAL_SECONDS = int(os.getenv("FULL_SYNC_INTERVAL_SECONDS", "86400"))
 
 client = SmartdailyClient()
 push_service = PushService()
@@ -62,6 +63,28 @@ poll_status: dict[str, Any] = {
 }
 poll_lock = asyncio.Lock()
 manual_poll_task: asyncio.Task[None] | None = None
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _is_full_sync_due(last_full_sync_at: str | None, now: datetime) -> bool:
+    """Return whether a complete history sync is due or its saved time is invalid."""
+    if not last_full_sync_at:
+        return True
+
+    try:
+        last_sync = datetime.fromisoformat(str(last_full_sync_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return True
+
+    if last_sync.tzinfo is None:
+        last_sync = last_sync.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    return now >= last_sync + timedelta(seconds=FULL_SYNC_INTERVAL_SECONDS)
 
 
 async def ensure_announcement_attachments_cached(announcement_id: str) -> dict[str, Any] | None:
@@ -136,7 +159,7 @@ async def fetch_all_reminders() -> list[dict[str, Any]]:
 
 
 async def poll_once() -> dict[str, Any]:
-    """Fetch all SmartDaily pages, sync local JSON, cache attachments, and send pushes."""
+    """Incrementally sync recent messages and periodically refresh the full history."""
     if poll_lock.locked():
         logger.info("Poll skipped because another poll is already running")
         return {"skipped": True, "reason": "already_running"}
@@ -147,13 +170,28 @@ async def poll_once() -> dict[str, Any]:
     poll_status["is_running"] = True
     try:
         poll_status["last_trace_id"] = trace_id
-        logger.info("Poll started")
+        poll_started_at = _utc_now()
+        metadata = push_service.get_store_metadata()
+        full_sync = _is_full_sync_due(metadata.get("last_full_sync_at"), poll_started_at)
+        logger.info(
+            "Poll started (full_sync=%s, full_sync_interval=%ds)",
+            full_sync,
+            FULL_SYNC_INTERVAL_SECONDS,
+        )
         try:
-            ann_result, rem_items = await asyncio.gather(
-                fetch_all_announcements(),
-                fetch_all_reminders(),
-            )
-            ann_data, ann_items = ann_result
+            if full_sync:
+                ann_result, rem_items = await asyncio.gather(
+                    fetch_all_announcements(),
+                    fetch_all_reminders(),
+                )
+                ann_data, ann_items = ann_result
+            else:
+                ann_data, reminder_data = await asyncio.gather(
+                    client.get_announcements(offset=0, max_count=10),
+                    client.get_my_reminders(),
+                )
+                ann_items = ann_data.get("items", [])
+                rem_items = reminder_data.get("items", [])
 
             logger.info(
                 "Polled %d announcements and %d reminders",
@@ -163,13 +201,17 @@ async def poll_once() -> dict[str, Any]:
             events = push_service.sync_messages(
                 announcements=ann_items,
                 reminders=rem_items,
-                full_sync=True,
+                full_sync=full_sync,
             )
-            push_service.update_store_metadata(
-                community_name=ann_data.get("community_name", ""),
-                com_id=ann_data.get("com_id", ""),
-                last_synced_at=datetime.now(timezone.utc).isoformat(),
-            )
+            sync_completed_at = _utc_now()
+            metadata_updates = {
+                "community_name": ann_data.get("community_name", ""),
+                "com_id": ann_data.get("com_id", ""),
+                "last_synced_at": sync_completed_at.isoformat(),
+            }
+            if full_sync:
+                metadata_updates["last_full_sync_at"] = sync_completed_at.isoformat()
+            push_service.update_store_metadata(**metadata_updates)
             for ev in events:
                 logger.info("New %s recorded (%s): %s", ev["type"], ev["id"], ev["title"])
 
@@ -183,7 +225,7 @@ async def poll_once() -> dict[str, Any]:
             failed_count = push_res.get("failed", 0)
             active_subs = push_res.get("active_subscribers", 0)
 
-            poll_status["last_poll_at"] = datetime.now(timezone.utc).isoformat()
+            poll_status["last_poll_at"] = _utc_now().isoformat()
             poll_status["last_error"] = None
             logger.info(
                 "Poll completed: announcements=%d, reminders=%d, new_events=%d, pushed=%d, "
@@ -243,6 +285,7 @@ async def background_poll_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    push_service.migrate()
     task = None
     if os.getenv("DISABLE_BACKGROUND_POLL", "") != "1":
         task = asyncio.create_task(background_poll_loop())
@@ -314,7 +357,9 @@ async def list_announcements(offset: int = 0, max_count: int = 10) -> dict[str, 
 async def get_announcement_detail(announcement_id: str) -> dict[str, Any]:
     stored = push_service.get_stored_announcement_detail(announcement_id)
     if not stored:
-        raise HTTPException(status_code=404, detail="本地 JSON 尚未收錄此公告")
+        stored = push_service.get_announcement_reminder_fallback(announcement_id)
+    if not stored:
+        raise HTTPException(status_code=404, detail="本機尚未收錄此公告")
     return stored
 
 
@@ -374,7 +419,7 @@ async def send_test_push(payload: TestPushPayload | None = None) -> dict[str, An
             latest_ann = latest_ann_items[0] if latest_ann_items else None
             latest_rem = latest_rem_items[0] if latest_rem_items else None
             community_name = metadata.get("community_name") or "社區"
-            title = title or f"[🔔 推播測試] {community_name} 通知連線正常"
+            title = title or f"🔔 [推播測試] {community_name} 通知連線正常"
             parts = []
             if latest_ann:
                 parts.append(f"📢 最新公告：{latest_ann.get('title', '')}")

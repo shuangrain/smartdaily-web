@@ -337,7 +337,7 @@
       </div>
       <div class="header-actions">
         <button class="btn" id="togglePushPanelBtn" title="推播通知設定">🔔 推播</button>
-        <button class="btn" id="refreshBtn" title="重新整理">🔄 更新</button>
+        <button class="btn" id="refreshBtn" title="立即更新公告與提醒">⚡ 立即更新</button>
       </div>
     </div>
     <div class="tabs">
@@ -356,7 +356,6 @@
         <button class="btn btn-primary" id="enablePushBtn">🔔 開啟推播通知</button>
         <button class="btn btn-danger" id="disablePushBtn" style="display:none;">🔕 取消推播通知</button>
         <button class="btn btn-accent" id="testPushBtn">📨 發送測試推播</button>
-        <button class="btn" id="pollNowBtn">⚡ 立即檢查新訊息</button>
       </div>
     </section>
 
@@ -592,7 +591,11 @@
         titleEl.textContent = detail.title || fallbackAnn?.title || "公告詳情";
         const dateLabel = detail.create_date || fallbackAnn?.create_date || fallbackAnn?.start_date || "";
         metaEl.innerHTML = `${deletedBadge}<span class="badge badge-type">${escapeHtml(detail.type_name || "公告")}</span>${dateLabel ? ` <span>📅 ${escapeHtml(dateLabel)}</span>` : ""}`;
-        if (detail.content || fallbackAnn?.content) {
+        if (detail.detail_unavailable) {
+          contentEl.textContent = detail.content
+            ? `${detail.content}\n\n本機只保存了提醒中的摘要，沒有這則公告的完整內容或附件。`
+            : "本機只保存了這則提醒，沒有這則公告的完整內容或附件。";
+        } else if (detail.content || fallbackAnn?.content) {
           contentEl.textContent = detail.content || fallbackAnn?.content;
         } else if (detail.error_description) {
           contentEl.textContent = `⚠️ 智生活雲端回應：「${detail.error_description}」\n\n此公告於本服務部署前已由社區下架或刪除回收，因此智生活雲端與本地皆無留存原始內文與附件。`;
@@ -845,11 +848,34 @@
         requestAnimationFrame(maybeAutoLoadMore);
       });
     });
-    document.getElementById("refreshBtn").addEventListener("click", () => {
+    document.getElementById("refreshBtn").addEventListener("click", async () => {
       clearAppBadgeIfSupported();
-      loadStatus();
-      loadTabContent(currentTab);
-      showToast("🔄 已重新載入最新資料");
+      try {
+        const beforeResponse = await fetch("/api/status");
+        const beforeStatus = await beforeResponse.json();
+        const previousTraceId = beforeStatus.poll?.last_trace_id;
+        const res = await fetch("/api/poll-now", { method: "POST" });
+        const data = await res.json();
+        showToast(data.started ? "🔄 正在更新公告與提醒..." : "⏳ 背景更新已在執行中");
+
+        let observedPoll = Boolean(beforeStatus.poll?.is_running);
+        while (true) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          const statusResponse = await fetch("/api/status");
+          const statusData = await statusResponse.json();
+          const poll = statusData.poll || {};
+          if (poll.is_running || (poll.last_trace_id && poll.last_trace_id !== previousTraceId)) {
+            observedPoll = true;
+          }
+          if (observedPoll && !poll.is_running) break;
+        }
+
+        await loadStatus();
+        await loadTabContent(currentTab);
+        showToast("✅ 公告與提醒已更新");
+      } catch (err) {
+        showToast("更新失敗：" + err.message);
+      }
     });
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") {
@@ -882,15 +908,6 @@
       );
       sentinelObserver.observe(document.getElementById("scrollSentinel"));
     }
-    document.getElementById("pollNowBtn").addEventListener("click", async () => {
-      try {
-        const res = await fetch("/api/poll-now", { method: "POST" });
-        const data = await res.json();
-        showToast(data.started ? "⚡ 已啟動背景同步，完成後重新載入資料" : "⏳ 背景同步已在執行中");
-      } catch (err) {
-        showToast("觸發背景同步失敗：" + err.message);
-      }
-    });
     document.getElementById("closeModalBtn").addEventListener("click", () => {
       document.getElementById("detailModal").classList.remove("open");
     });

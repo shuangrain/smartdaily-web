@@ -16,6 +16,8 @@ from py_vapid import Vapid
 from py_vapid.utils import b64urlencode
 from pywebpush import WebPushException, webpush
 
+from .database import SQLiteStore
+
 logger = logging.getLogger(__name__)
 
 REMINDER_TYPE_LABELS: dict[str, str] = {
@@ -69,20 +71,18 @@ def _parse_iso_ts(val: Any) -> float | None:
 
 
 def _message_is_pushable_for_device(msg: dict[str, Any], sub: dict[str, Any]) -> bool:
-    """Ignore messages before device creation; unknown timestamps use UID tracking."""
+    """Ignore messages already stored before device creation and older reminders."""
     cutoff = _parse_iso_ts(sub.get("create_time") or sub.get("subscribed_at"))
     if cutoff is None:
         return True
+
+    discovered_at = _parse_iso_ts(msg.get("discovered_at"))
+    if discovered_at is not None and discovered_at < cutoff:
+        return False
+
     item = msg.get("item") if isinstance(msg.get("item"), dict) else {}
     message_time = _parse_iso_ts(item.get("pushing_time"))
     return message_time is None or message_time >= cutoff
-
-
-def _atomic_write_json(path: Path, data: Any) -> None:
-    """Atomically write JSON data to path via a temporary file rename."""
-    tmp_path = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}")
-    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(path)
 
 
 class PushService:
@@ -92,18 +92,20 @@ class PushService:
         base_dir = Path(data_dir or os.getenv("DATA_DIR", "./data"))
         base_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir = base_dir
-        self.devices_dir = self.data_dir / "devices"
-        self.devices_dir.mkdir(parents=True, exist_ok=True)
         self.attachments_dir = self.data_dir / "attachments"
         self.attachments_dir.mkdir(parents=True, exist_ok=True)
         self.vapid_file = self.data_dir / "vapid_keys.json"
-        self.messages_file = self.data_dir / "messages.json"
-        self.legacy_subs_file = self.data_dir / "subscriptions.json"
         self.legacy_seen_file = self.data_dir / "seen_state.json"
         self.vapid_subject = os.getenv("VAPID_SUBJECT", "mailto:admin@example.com")
         self._store_lock = threading.RLock()
+        self.database = SQLiteStore(self.data_dir)
+        self.database_file = self.database.database_file
         self.public_key, self.private_key = self._load_or_create_vapid_keys()
-        self._migrate_legacy_subscriptions()
+        self.migrate()
+
+    def migrate(self) -> None:
+        """Apply pending SQLite schema changes and import existing JSON data once."""
+        self.database.migrate()
 
     def _load_or_create_vapid_keys(self) -> tuple[str, str]:
         """Load VAPID keys from env or disk, or generate a new EC P-256 keypair."""
@@ -137,47 +139,35 @@ class PushService:
         return pub_b64, priv_b64
 
     # -------------------------------------------------------------------------
-    # Central Message Store (data/messages.json)
+    # Central Message Store (SQLite)
     # -------------------------------------------------------------------------
     def get_message_store(self) -> dict[str, Any]:
-        """Read the central message store from messages.json."""
-        if not self.messages_file.is_file():
-            return {"initialized_types": [], "messages": [], "metadata": {}}
-        try:
-            data = json.loads(self.messages_file.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                return {
-                    "initialized_types": ["announcement", "personal", "reminder"],
-                    "messages": data,
-                    "metadata": {},
-                }
-            return {
-                "initialized_types": list(data.get("initialized_types", [])),
-                "messages": list(data.get("messages", [])),
-                "metadata": dict(data.get("metadata", {})),
-            }
-        except Exception:
-            return {"initialized_types": [], "messages": [], "metadata": {}}
+        """Read database records in the message shape used by the application logic."""
+        store = self.database.load_message_store()
+        for message in store["messages"]:
+            candidate = self._build_candidate_record(
+                message["type"], message.get("item", {}), message.get("discovered_at", "")
+            )
+            if candidate:
+                message.update({key: candidate[key] for key in ("title", "body", "url", "tag")})
+                if message["type"] == "reminder":
+                    message["feature_name"] = candidate["feature_name"]
+        return store
 
     def get_messages(self) -> list[dict[str, Any]]:
         """Return all stored messages (newest first)."""
         return self.get_message_store()["messages"]
 
     def save_message_store(self, store: dict[str, Any]) -> None:
-        """Persist all messages to messages.json atomically without upper limit."""
-        payload = {
-            "initialized_types": list(dict.fromkeys(store.get("initialized_types", []))),
-            "messages": list(store.get("messages", [])),
-            "metadata": dict(store.get("metadata", {})),
-        }
-        _atomic_write_json(self.messages_file, payload)
+        """Persist messages and sync metadata in one SQLite transaction."""
+        self.database.save_message_store(store)
 
     def get_store_metadata(self) -> dict[str, Any]:
         """Return background sync metadata persisted alongside messages."""
         return self.get_message_store().get("metadata", {})
 
     def update_store_metadata(self, **values: Any) -> None:
-        """Update metadata in messages.json, preserving messages and initialization state."""
+        """Update metadata while preserving messages and initialization state."""
         with self._store_lock:
             store = self.get_message_store()
             store["metadata"].update(values)
@@ -186,7 +176,7 @@ class PushService:
     def get_message_page(
         self, msg_type: str, offset: int = 0, max_count: int = 10
     ) -> tuple[list[dict[str, Any]], int]:
-        """Read a sorted page of display items from messages.json."""
+        """Read a sorted page of display items from SQLite."""
         with self._store_lock:
             records = [m for m in self.get_messages() if m.get("type") == msg_type]
             items = [self._reconstruct_display_item(m) for m in records]
@@ -214,78 +204,29 @@ class PushService:
             return items[start : start + count], total
 
     # -------------------------------------------------------------------------
-    # Per-Device Files (data/devices/<device_id>.json)
+    # Per-Device SQLite records
     # -------------------------------------------------------------------------
-    def _device_file(self, device_id: str) -> Path:
-        return self.devices_dir / f"{device_id}.json"
-
-    def _migrate_legacy_subscriptions(self) -> None:
-        """Migrate legacy data/subscriptions.json into per-device files in data/devices/."""
-        if not self.legacy_subs_file.is_file():
-            return
-        try:
-            raw_subs = json.loads(self.legacy_subs_file.read_text(encoding="utf-8"))
-            if isinstance(raw_subs, list):
-                for sub in raw_subs:
-                    endpoint = sub.get("endpoint")
-                    if not endpoint:
-                        continue
-                    device_id = sub.get("device_id") or _make_device_id(endpoint)
-                    sub["device_id"] = device_id
-                    dev_path = self._device_file(device_id)
-                    if not dev_path.is_file():
-                        _atomic_write_json(dev_path, sub)
-            self.legacy_subs_file.unlink()
-        except Exception as exc:
-            logger.warning("Failed to migrate legacy subscriptions.json: %s", exc)
-
     def get_device_subscription(self, device_id: str) -> dict[str, Any] | None:
-        """Read a single device's subscription and pushed state file."""
-        dev_path = self._device_file(device_id)
-        if not dev_path.is_file():
-            return None
-        try:
-            sub = json.loads(dev_path.read_text(encoding="utf-8"))
-            if "device_id" not in sub and sub.get("endpoint"):
-                sub["device_id"] = device_id
-            return sub
-        except Exception:
-            return None
+        """Read a device subscription and its sent-message projection from SQLite."""
+        return self.database.get_device(device_id)
 
     def save_device_subscription(self, sub: dict[str, Any]) -> None:
-        """Atomically save a single device's subscription file."""
-        endpoint = sub.get("endpoint", "")
-        device_id = sub.get("device_id") or _make_device_id(endpoint)
-        sub["device_id"] = device_id
-        _atomic_write_json(self._device_file(device_id), sub)
+        """Save a subscription and synchronize its legacy sent-UID projection."""
+        self.database.save_device(sub)
 
     def delete_device_subscription(self, device_id: str) -> None:
-        """Delete a single device's subscription file if it exists."""
-        dev_path = self._device_file(device_id)
-        if dev_path.is_file():
-            try:
-                dev_path.unlink()
-            except Exception:
-                pass
+        """Delete one device; SQLite cascades its delivery records."""
+        self.database.delete_device(device_id)
 
     def get_subscriptions(self) -> list[dict[str, Any]]:
-        """Return all active device subscriptions from data/devices/*.json."""
-        subs: list[dict[str, Any]] = []
-        for path in sorted(self.devices_dir.glob("*.json")):
-            try:
-                sub = json.loads(path.read_text(encoding="utf-8"))
-                if sub.get("endpoint"):
-                    sub.setdefault("device_id", _make_device_id(sub["endpoint"]))
-                    subs.append(sub)
-            except Exception:
-                continue
-        return subs
+        """Return all active device subscriptions from SQLite."""
+        return self.database.list_devices()
 
     def add_subscription(self, subscription: dict[str, Any], user_agent: str = "") -> int:
         """
-        Register or update a single device subscription in data/devices/<device_id>.json.
-        New devices initialize pushed_message_uids with currently stored messages
-        so they only receive messages arriving after subscription time.
+        Register or update one device subscription in SQLite.
+        New devices use message timestamps to skip history and only baseline messages
+        whose discovery time is unknown.
         """
         endpoint = subscription.get("endpoint")
         if not endpoint:
@@ -294,18 +235,20 @@ class PushService:
         with self._store_lock:
             device_id = _make_device_id(endpoint)
             existing = self.get_device_subscription(device_id)
-            known_uids = [m["uid"] for m in self.get_messages() if m.get("uid")]
+            now = datetime.now(timezone.utc).isoformat()
+            messages = self.get_messages()
+            unknown_discovery_uids = [
+                m["uid"]
+                for m in messages
+                if m.get("uid") and _parse_iso_ts(m.get("discovered_at")) is None
+            ]
 
             if existing and "pushed_message_uids" in existing:
                 pushed_uids = list(existing["pushed_message_uids"])
-                subscribed_at = (
-                    existing.get("subscribed_at")
-                    or existing.get("create_time")
-                    or datetime.now(timezone.utc).isoformat()
-                )
+                subscribed_at = existing.get("subscribed_at") or existing.get("create_time") or now
             else:
-                pushed_uids = list(known_uids)
-                subscribed_at = datetime.now(timezone.utc).isoformat()
+                pushed_uids = unknown_discovery_uids
+                subscribed_at = now
 
             self.save_device_subscription(
                 {
@@ -466,6 +409,7 @@ class PushService:
         if msg_type == "reminder":
             feature = str(raw_item.get("feature_name") or "").strip()
             type_label = get_reminder_type_label(feature)
+            emoji, separator, category = type_label.partition(" ")
             rem_title = str(raw_item.get("title") or "").strip() or "新提醒通知"
             target_id = str(raw_item.get("target_id") or "").strip()
             target_url = (
@@ -478,7 +422,7 @@ class PushService:
                 "type": "reminder",
                 "id": item_id,
                 "feature_name": feature,
-                "title": f"[{type_label}] {rem_title}",
+                "title": f"{emoji} [{category if separator else type_label}] {rem_title}",
                 "body": (raw_item.get("body") or "點擊查看提醒內容")[:120],
                 "url": target_url,
                 "tag": f"rem-{item_id}",
@@ -539,16 +483,15 @@ class PushService:
         existing_messages: list[dict[str, Any]],
         msg_type: str,
         live_items: list[dict[str, Any]],
-        page_size: int = 10,
         full_sync: bool = False,
     ) -> None:
         """
         Mark stored messages of msg_type as is_deleted=True if they are missing
-        from the latest response. When full_sync=True (all pages fetched), any
-        missing stored message is marked as recalled.
+        from the latest response. Partial syncs use the first-page cutoff to avoid
+        marking older, unseen messages as recalled; full syncs can mark any missing
+        stored message as recalled.
         """
         live_by_id = {str(it.get("id", "")): it for it in live_items if it.get("id")}
-        has_more_pages = False if full_sync else (len(live_items) >= page_size)
 
         # Compute minimum numeric ID or timestamp on current top page to distinguish pagination
         if msg_type == "announcement":
@@ -593,7 +536,7 @@ class PushService:
             else:
                 was_deleted = bool(msg.get("is_deleted", False))
                 msg.setdefault("is_deleted", False)
-                if not has_more_pages:
+                if full_sync:
                     msg["is_deleted"] = True
                 else:
                     stored_int_id = _safe_int(mid)
@@ -626,11 +569,11 @@ class PushService:
     ) -> list[dict[str, Any]]:
         """
         Record fetched announcements, personal notifications, and reminders into
-        the central message store (data/messages.json) without upper limit, and
+        the central message store without an upper limit, and
         update is_deleted flags for recalled messages.
         When a category is initialized for the first time, or when older historical
         messages from subsequent pages are backfilled, they are recorded into the
-        message store AND marked as baseline in each existing device file so old
+        message store and marked as baseline for each existing device so old
         historical messages do not trigger push floods.
         Returns the list of newly discovered non-baseline messages.
         """
@@ -717,7 +660,7 @@ class PushService:
                 }
             )
 
-            # Ensure each existing device file has baseline UIDs recorded independently
+            # Ensure each existing device has baseline UIDs recorded independently
             all_current_uids = [m["uid"] for m in updated_messages]
             for sub in self.get_subscriptions():
                 device_id = sub["device_id"]
@@ -749,7 +692,7 @@ class PushService:
     ) -> list[dict[str, Any]]:
         """
         Read-only merge of live items (is_deleted=False) with recalled items
-        (is_deleted=True) stored in messages.json. Does not write to messages.json.
+        (is_deleted=True) stored in SQLite. Does not write during reads.
         """
         live_ids = {str(it.get("id", "")) for it in live_items if it.get("id")}
         result_items = [dict(it, is_deleted=False) for it in live_items]
@@ -784,7 +727,7 @@ class PushService:
         return combined
 
     def get_uncached_announcement_ids(self) -> list[str]:
-        """Return announcement IDs in messages.json whose attachments are not yet cached."""
+        """Return announcement IDs whose attachments are not yet cached."""
         with self._store_lock:
             return [
                 str(m["id"])
@@ -821,7 +764,7 @@ class PushService:
     ) -> list[dict[str, Any]]:
         """
         Save downloaded attachment binaries to data/attachments/<announcement_id>/
-        and update the announcement record in data/messages.json with local attachment URLs.
+        and save attachment metadata and local URLs in SQLite.
         """
         safe_ann_id = str(announcement_id).strip()
         if not safe_ann_id or "/" in safe_ann_id or ".." in safe_ann_id:
@@ -881,7 +824,7 @@ class PushService:
 
     def get_stored_announcement_detail(self, announcement_id: str) -> dict[str, Any] | None:
         """
-        Retrieve an announcement from messages.json (including locally backed-up attachments).
+        Retrieve an announcement from SQLite (including locally backed-up attachments).
         """
         with self._store_lock:
             store = self.get_message_store()
@@ -904,6 +847,38 @@ class PushService:
                 "is_deleted": bool(found.get("is_deleted", False)),
             }
 
+    def get_announcement_reminder_fallback(self, announcement_id: str) -> dict[str, Any] | None:
+        """Return the saved reminder text when its linked announcement is not archived."""
+        with self._store_lock:
+            store = self.get_message_store()
+            found = next(
+                (
+                    msg
+                    for msg in store["messages"]
+                    if msg.get("type") == "reminder"
+                    and isinstance(msg.get("item"), dict)
+                    and str(msg["item"].get("feature_name", "")).strip() == "Ann"
+                    and str(msg["item"].get("target_id", "")) == str(announcement_id)
+                ),
+                None,
+            )
+            if not found:
+                return None
+
+            item = found["item"]
+            return {
+                "id": str(announcement_id),
+                "title": str(item.get("title") or "社區公告通知"),
+                "type_name": "公告摘要",
+                "create_date": str(item.get("pushing_time") or ""),
+                "content": str(item.get("body") or ""),
+                "attachments": [],
+                "attachment_count": 0,
+                "attachments_cached": False,
+                "is_deleted": False,
+                "detail_unavailable": True,
+            }
+
     def check_and_record_new_items(
         self,
         announcements: list[dict[str, Any]],
@@ -919,9 +894,8 @@ class PushService:
 
     def push_unpushed_messages(self) -> dict[str, Any]:
         """
-        For each subscribed device file in data/devices/<device_id>.json, find
-        messages in data/messages.json not yet pushed to that device, send Web Push,
-        and update only that device's file atomically.
+        Find messages not yet pushed to each device, send Web Push, and record
+        delivery attempts in SQLite.
         """
         messages = self.get_messages()
         subs = self.get_subscriptions()
@@ -958,7 +932,6 @@ class PushService:
             ]
 
             device_expired = False
-            newly_pushed_for_device: list[str] = []
 
             for msg in unpushed:
                 logger.info(
@@ -971,7 +944,7 @@ class PushService:
                 status = self._send_single_push(latest_sub, msg)
                 if status == "sent":
                     sent += 1
-                    newly_pushed_for_device.append(msg["uid"])
+                    self.database.record_delivery(device_id, msg["uid"], "sent")
                     pushed_set.add(msg["uid"])
                     logger.info(
                         "Push delivered to device %s for %s (%s)",
@@ -986,6 +959,7 @@ class PushService:
                     break
                 else:
                     failed += 1
+                    self.database.record_delivery(device_id, msg["uid"], "failed")
                     logger.warning(
                         "Push delivery failed for device %s on %s (%s); will retry on next poll",
                         device_id,
@@ -995,16 +969,6 @@ class PushService:
 
             if not device_expired:
                 active_count += 1
-                if newly_pushed_for_device:
-                    # Re-read device file in case it was updated or removed concurrently
-                    current_on_disk = self.get_device_subscription(device_id)
-                    if current_on_disk is not None:
-                        disk_uids = list(current_on_disk.get("pushed_message_uids", []))
-                        merged = list(
-                            dict.fromkeys(list(reversed(newly_pushed_for_device)) + disk_uids)
-                        )
-                        current_on_disk["pushed_message_uids"] = merged
-                        self.save_device_subscription(current_on_disk)
 
         return {
             "sent": sent,
