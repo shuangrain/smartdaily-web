@@ -8,9 +8,11 @@ authors = [
 ]
 requires-python = ">=3.10"
 dependencies = [
+    "alembic>=1.13,<2.0",
     "fastapi>=0.162.4",
     "httpx>=0.28.1",
     "pywebpush>=2.5.0",
+    "sqlalchemy>=2.0,<3.0",
     "uvicorn[standard]>=0.54.0",
 ]
 

@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -104,8 +106,12 @@ class PushService:
         self.migrate()
 
     def migrate(self) -> None:
-        """Apply pending SQLite schema changes and import existing JSON data once."""
+        """Apply the database schema and one-time device or attachment migrations."""
         self.database.migrate()
+
+    def remove_legacy_messages_file_after_full_sync(self) -> bool:
+        """Remove the old message export after a complete sync has been saved."""
+        return self.database.remove_legacy_messages_file_after_full_sync()
 
     def _load_or_create_vapid_keys(self) -> tuple[str, str]:
         """Load VAPID keys from env or disk, or generate a new EC P-256 keypair."""
@@ -369,6 +375,31 @@ class PushService:
             active_count,
         )
         return {"sent": sent, "failed": failed, "active_subscribers": active_count}
+
+    def send_push_to_device(
+        self,
+        endpoint: str,
+        title: str,
+        body: str,
+        url: str = "/",
+        tag: str = "smartdaily",
+    ) -> dict[str, int] | None:
+        """Send one immediate push to the registered device with this endpoint."""
+        sub = next(
+            (item for item in self.get_subscriptions() if item["endpoint"] == endpoint), None
+        )
+        if sub is None:
+            return None
+
+        payload_dict = {"title": title, "body": body, "url": url, "tag": tag}
+        logger.info("Sending targeted push (%s) to current device %s", tag, sub["device_id"])
+        status = self._send_single_push(sub, payload_dict)
+        if status == "expired":
+            self.delete_device_subscription(sub["device_id"])
+            return {"sent": 0, "failed": 1, "active_subscribers": 0}
+        if status == "failed":
+            return {"sent": 0, "failed": 1, "active_subscribers": 1}
+        return {"sent": 1, "failed": 0, "active_subscribers": 1}
 
     @staticmethod
     def _build_candidate_record(
@@ -763,62 +794,86 @@ class PushService:
         downloaded_files: dict[int, tuple[str, bytes]],
     ) -> list[dict[str, Any]]:
         """
-        Save downloaded attachment binaries to data/attachments/<announcement_id>/
-        and save attachment metadata and local URLs in SQLite.
+        Save downloaded files flat under data/attachments using UUID names.
+        The database keeps each original filename and its UUID file name.
         """
         safe_ann_id = str(announcement_id).strip()
         if not safe_ann_id or "/" in safe_ann_id or ".." in safe_ann_id:
             return detail.get("attachments", [])
 
-        ann_dir = self.attachments_dir / safe_ann_id
-        if downloaded_files:
-            ann_dir.mkdir(parents=True, exist_ok=True)
-
         saved_attachments: list[dict[str, Any]] = []
-        for att in detail.get("attachments", []):
-            idx = int(att.get("index", 1))
-            att_copy = dict(att)
-            if idx in downloaded_files:
-                local_name, file_bytes = downloaded_files[idx]
-                file_path = ann_dir / local_name
-                file_path.write_bytes(file_bytes)
-                att_copy["url"] = f"/api/attachments/{safe_ann_id}/{local_name}"
-                att_copy["local_file"] = local_name
-            saved_attachments.append(att_copy)
+        created_files: list[Path] = []
+        try:
+            with self._store_lock:
+                store = self.get_message_store()
+                target_uid = f"announcement:{safe_ann_id}"
+                found = next((m for m in store["messages"] if m.get("uid") == target_uid), None)
+                if not found:
+                    return detail.get("attachments", [])
 
-        with self._store_lock:
-            store = self.get_message_store()
-            target_uid = f"announcement:{safe_ann_id}"
-            found = next((m for m in store["messages"] if m.get("uid") == target_uid), None)
-            if found:
-                # Mark attachments_cached=True when all attachments are downloaded
-                expected_count = len(detail.get("attachments", []))
-                found["attachments_cached"] = len(downloaded_files) >= expected_count
+                for att in detail.get("attachments", []):
+                    idx = int(att.get("index", 1))
+                    att_copy = dict(att)
+                    if idx in downloaded_files:
+                        local_name, file_bytes = downloaded_files[idx]
+                        original_name = str(
+                            att_copy.get("original_name")
+                            or att_copy.get("filename")
+                            or att_copy.get("name")
+                            or local_name
+                        )
+                        stored_filename = str(uuid.uuid4())
+                        file_path = self.attachments_dir / stored_filename
+                        file_path.write_bytes(file_bytes)
+                        created_files.append(file_path)
+                        mime_type = str(
+                            att_copy.get("mime_type")
+                            or mimetypes.guess_type(original_name)[0]
+                            or ""
+                        )
+                        att_copy.update(
+                            {
+                                "filename": original_name,
+                                "original_name": original_name,
+                                "stored_filename": stored_filename,
+                                "local_file": stored_filename,
+                                "mime_type": mime_type,
+                                "url": f"/api/attachments/{stored_filename}",
+                            }
+                        )
+                    saved_attachments.append(att_copy)
+
+                found["attachments_cached"] = len(downloaded_files) >= len(
+                    detail.get("attachments", [])
+                )
                 found["attachments"] = saved_attachments
                 if detail.get("content"):
                     if not isinstance(found.get("item"), dict):
                         found["item"] = self._reconstruct_display_item(found)
                     found["item"]["content"] = detail["content"]
                 self.save_message_store(store)
+        except Exception:
+            for file_path in created_files:
+                file_path.unlink(missing_ok=True)
+            raise
 
         return saved_attachments
 
-    def get_attachment_file_path(self, announcement_id: str, filename: str) -> Path | None:
-        """Resolve and validate a local attachment path under data/attachments/."""
-        if (
-            not announcement_id
-            or not filename
-            or "/" in announcement_id
-            or "\\" in announcement_id
-            or ".." in announcement_id
-            or "/" in filename
-            or "\\" in filename
-            or ".." in filename
-        ):
+    def get_attachment_metadata(self, stored_filename: str) -> dict[str, str] | None:
+        """Return an attachment's original name and MIME type from SQLite."""
+        return self.database.get_attachment_metadata(stored_filename)
+
+    def get_attachment_file_path(self, stored_filename: str) -> Path | None:
+        """Resolve an attachment UUID only when it has a matching SQLite record."""
+        if not self.get_attachment_metadata(stored_filename):
             return None
-        candidate = (self.attachments_dir / announcement_id / filename).resolve()
+        try:
+            canonical_name = str(uuid.UUID(stored_filename))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        candidate = (self.attachments_dir / canonical_name).resolve()
         base_resolved = self.attachments_dir.resolve()
-        if not str(candidate).startswith(str(base_resolved) + os.sep):
+        if candidate.parent != base_resolved:
             return None
         return candidate if candidate.is_file() else None
 

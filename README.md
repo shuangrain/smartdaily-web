@@ -8,7 +8,7 @@
 
 公告與提醒會定時更新，網頁顯示已保存的內容。按「⚡ 立即更新」會檢查新訊息，完成後重新載入目前頁面。
 
-若已有舊版公告、提醒或裝置設定，首次啟動時會自動沿用，原有資料檔也會保留。
+首次啟動時會保留既有裝置的推播設定。公告與提醒會重新同步，完整更新成功後會移除舊訊息檔。
 
 1. **📢 社區公告**：公告內文與 PDF、圖片附件會保存下來。即使公告之後被社區撤下，已保存的內容仍可查看。
 2. **📬 我的提醒**：查看包裹、寄放物、社區公告、個人通知與其他提醒，也可以按類型篩選。
@@ -30,15 +30,15 @@ flowchart TD
         API_Rem["個人提醒"]
     end
 
-    subgraph App["社區通知服務"]
-        Poller["定時更新 / 手動檢查"]
-        WebUI["網站：查看公告、提醒與附件"]
+    subgraph App["smartdaily-web"]
+        Poller["背景更新：定時或手動"]
+        WebUI["網站：查看本機保存的公告與提醒"]
+        Push["發送推播通知"]
     end
 
     subgraph Data["本機保存的資料"]
-        MsgStore["公告與提醒紀錄"]
-        AttFiles["公告附件"]
-        DevFiles["各裝置的通知設定"]
+        MsgStore["資料庫：公告、提醒與裝置設定"]
+        AttFiles["公告附件：UUID 檔名"]
     end
 
     Users["手機、平板與電腦"]
@@ -47,12 +47,13 @@ flowchart TD
     Poller --> API_Rem
     Poller --> MsgStore
     Poller --> AttFiles
-    Poller --> DevFiles
     WebUI -->|"按鈕啟動更新"| Poller
     MsgStore --> WebUI
     AttFiles --> WebUI
-    Poller -->|"新提醒通知"| Users
-    Users -->|"瀏覽與管理通知"| WebUI
+    Poller -->|"新提醒"| Push
+    Push --> Users
+    WebUI -->|"測試推播只送目前裝置"| Push
+    Users -->|"查看內容或管理推播"| WebUI
 ```
 
 ---

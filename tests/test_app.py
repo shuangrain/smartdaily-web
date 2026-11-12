@@ -28,7 +28,7 @@ def test_clean_html_text():
     assert "<p>" not in cleaned
 
 
-def test_sqlite_migrates_legacy_messages_and_devices_once(tmp_path: Path):
+def test_startup_skips_legacy_messages_but_preserves_device_subscriptions(tmp_path: Path, caplog):
     import json
     import sqlite3
 
@@ -85,19 +85,24 @@ def test_sqlite_migrates_legacy_messages_and_devices_once(tmp_path: Path):
     svc = PushService(data_dir=tmp_path)
 
     assert svc.database_file.is_file()
-    assert svc.get_store_metadata()["community_name"] == "測試社區"
-    assert svc.get_store_metadata()["last_full_sync_at"] == "2026-11-10T10:00:00+00:00"
-    assert [message["uid"] for message in svc.get_messages()] == ["reminder:r-legacy"]
-    assert svc.get_subscriptions()[0]["pushed_message_uids"] == ["reminder:r-legacy"]
+    assert svc.get_store_metadata() == {}
+    assert svc.get_messages() == []
+    assert svc.get_subscriptions()[0]["endpoint"] == legacy_device["endpoint"]
+    assert svc.get_subscriptions()[0]["pushed_message_uids"] == []
     assert messages_path.is_file()
-    assert device_path.is_file()
+    assert not device_path.exists()
+    assert (tmp_path / "vapid_keys.json").is_file()
+    assert "Skipped importing legacy messages.json" in caplog.text
+    assert "Imported 1 legacy device subscription" in caplog.text
+    assert "Removed 1 legacy device subscription file" in caplog.text
 
     svc = PushService(data_dir=tmp_path)
-    assert [message["uid"] for message in svc.get_messages()] == ["reminder:r-legacy"]
+    assert svc.get_messages() == []
+    assert messages_path.is_file()
     with sqlite3.connect(svc.database_file) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
-        assert connection.execute("SELECT COUNT(*) FROM push_deliveries").fetchone()[0] == 1
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] >= 2
+        assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM devices").fetchone()[0] == 1
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0003"
 
 
 def test_sqlite_baselines_legacy_device_without_delivery_history(tmp_path: Path):
@@ -141,7 +146,9 @@ def test_sqlite_baselines_legacy_device_without_delivery_history(tmp_path: Path)
 
     svc = PushService(data_dir=tmp_path)
 
-    assert svc.get_subscriptions()[0]["pushed_message_uids"] == ["reminder:r-old"]
+    assert svc.get_subscriptions()[0]["pushed_message_uids"] == []
+    assert messages_path.exists()
+    assert not (devices_dir / "legacy-device.json").exists()
 
 
 def test_sqlite_round_trips_typed_messages_and_attachments(tmp_path: Path):
@@ -214,6 +221,47 @@ def test_sqlite_round_trips_typed_messages_and_attachments(tmp_path: Path):
     assert stored["personal:p-1"]["item"]["content"] == "個人通知內容"
 
 
+def test_startup_flattens_existing_announcement_attachment_files(tmp_path: Path, caplog):
+    import sqlite3
+
+    svc = PushService(data_dir=tmp_path)
+    svc.sync_messages(announcements=[{"id": "legacy-announcement", "title": "舊公告"}])
+    store = svc.get_message_store()
+    message = store["messages"][0]
+    message["attachments_cached"] = True
+    message["attachments"] = [
+        {
+            "filename": "notice.pdf",
+            "local_file": "1_notice.pdf",
+            "url": "/api/attachments/legacy-announcement/1_notice.pdf",
+            "type": "pdf",
+        }
+    ]
+    svc.save_message_store(store)
+    legacy_path = tmp_path / "attachments" / "legacy-announcement" / "1_notice.pdf"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_bytes(b"%PDF-legacy")
+    with sqlite3.connect(svc.database_file) as connection:
+        connection.execute(
+            "UPDATE message_attachments SET original_name='', mime_type='', stored_filename=NULL "
+            "WHERE purpose='archive'"
+        )
+
+    migrated = PushService(data_dir=tmp_path)
+    detail = migrated.get_stored_announcement_detail("legacy-announcement")
+    assert detail is not None
+    attachment = detail["attachments"][0]
+    stored_filename = attachment["url"].rsplit("/", 1)[-1]
+    assert attachment["url"] == f"/api/attachments/{stored_filename}"
+    assert attachment["filename"] == "notice.pdf"
+    assert not legacy_path.exists()
+    flattened_path = migrated.get_attachment_file_path(stored_filename)
+    assert flattened_path is not None
+    assert flattened_path.parent == tmp_path / "attachments"
+    assert flattened_path.read_bytes() == b"%PDF-legacy"
+    assert "Flattened legacy attachment storage: moved=1" in caplog.text
+
+
 def test_sqlite_preserves_message_order_after_incremental_sync(tmp_path: Path):
     svc = PushService(data_dir=tmp_path)
     svc.sync_messages(
@@ -246,36 +294,171 @@ def test_sqlite_preserves_message_order_after_incremental_sync(tmp_path: Path):
     assert [message["id"] for message in svc.get_messages()] == ["r-new", "r-old"]
 
 
-def test_sqlite_schema_migration_rolls_back_and_can_retry(tmp_path: Path):
+def test_sqlalchemy_schema_migrations_log_and_run_idempotently(tmp_path: Path, caplog):
     import sqlite3
+
+    svc = PushService(data_dir=tmp_path)
+    assert "Applying Alembic schema migrations" in caplog.text
+    assert "Alembic schema migration complete" in caplog.text
+
+    with sqlite3.connect(svc.database_file) as connection:
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0003"
+
+    caplog.clear()
+    PushService(data_dir=tmp_path)
+    assert "Alembic schema is current" in caplog.text
+
+
+def test_alembic_schema_has_all_columns_defined_by_orm_models(tmp_path: Path):
+    from sqlalchemy import inspect
+
+    from smartdaily_web.models import Base
+
+    svc = PushService(data_dir=tmp_path)
+    inspector = inspect(svc.database.engine)
+
+    assert set(inspector.get_table_names()) - {"alembic_version"} == set(Base.metadata.tables)
+    for table in Base.metadata.sorted_tables:
+        actual_columns = {column["name"] for column in inspector.get_columns(table.name)}
+        expected_columns = set(table.columns.keys())
+        assert actual_columns == expected_columns, table.name
+
+
+def test_alembic_adopts_existing_sqlite_data_without_losing_subscriptions(tmp_path: Path, caplog):
+    import sqlite3
+
+    from alembic import command
+    from alembic.config import Config
+
+    database_file = tmp_path / "smartdaily.sqlite3"
+    repo_root = Path(__file__).resolve().parent.parent
+    config = Config(str(repo_root / "alembic.ini"))
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{database_file}")
+    command.upgrade(config, "0001")
+
+    with sqlite3.connect(database_file) as connection:
+        connection.execute("DROP TABLE message_attachments")
+        connection.execute(
+            "CREATE TABLE message_attachments ("
+            "message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE, "
+            "purpose TEXT NOT NULL CHECK (purpose IN ('source', 'archive')), "
+            "position INTEGER NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}', "
+            "PRIMARY KEY(message_id, purpose, position))"
+        )
+        connection.execute(
+            "CREATE TABLE schema_migrations "
+            "(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)"
+        )
+        connection.execute("DROP TABLE alembic_version")
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (2, 'import_legacy_json', '2026-11-10T00:00:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO messages(type, external_id, discovered_at, sort_order) "
+            "VALUES ('reminder', 'kept-in-sqlite', '2026-11-10T10:00:00Z', 0)"
+        )
+        connection.execute(
+            "INSERT INTO reminders(message_id, title, body, feature_name) "
+            "VALUES (1, '保留的提醒', '保留內容', 'postal')"
+        )
+        connection.execute(
+            "INSERT INTO devices(device_id, endpoint, p256dh, auth, subscribed_at) "
+            "VALUES ('old-device', 'https://web.push.apple.com/old-db-device', 'key', 'auth', "
+            "'2026-11-10T09:00:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO push_deliveries(device_id, message_id, status) "
+            "VALUES ('old-device', 1, 'sent')"
+        )
+        connection.execute(
+            "UPDATE sync_state SET last_full_sync_at='2026-11-13T00:00:00+00:00' "
+            "WHERE singleton_id=1"
+        )
+
+    svc = PushService(data_dir=tmp_path)
+
+    assert [message["uid"] for message in svc.get_messages()] == ["reminder:kept-in-sqlite"]
+    assert svc.get_subscriptions()[0]["endpoint"] == "https://web.push.apple.com/old-db-device"
+    assert svc.get_subscriptions()[0]["pushed_message_uids"] == ["reminder:kept-in-sqlite"]
+    assert "last_full_sync_at" not in svc.get_store_metadata()
+    assert "Cleared last full sync time" in caplog.text
+    with sqlite3.connect(database_file) as connection:
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0003"
+
+
+def test_malformed_legacy_messages_json_is_ignored_and_retained(tmp_path: Path, caplog):
+    messages_path = tmp_path / "messages.json"
+    messages_path.write_text("{invalid json", encoding="utf-8")
+
+    svc = PushService(data_dir=tmp_path)
+
+    assert svc.get_messages() == []
+    assert messages_path.exists()
+    assert "Skipped importing legacy messages.json" in caplog.text
+
+
+def test_successful_full_sync_removes_legacy_messages_json(tmp_path: Path, monkeypatch, caplog):
+    import asyncio
+    import importlib
+
+    main_mod = importlib.import_module("smartdaily_web.main")
+    svc = PushService(data_dir=tmp_path)
+    monkeypatch.setattr(main_mod, "push_service", svc)
+    monkeypatch.setattr(main_mod, "poll_lock", asyncio.Lock())
+    monkeypatch.setattr(
+        main_mod,
+        "poll_status",
+        {"last_poll_at": None, "last_trace_id": None, "last_error": None, "is_running": False},
+    )
+    messages_path = tmp_path / "messages.json"
+    messages_path.write_text("old messages", encoding="utf-8")
+
+    async def fetch_announcements():
+        return ({"community_name": "測試社區", "com_id": "123"}, [])
+
+    async def fetch_reminders():
+        return []
+
+    monkeypatch.setattr(main_mod, "fetch_all_announcements", fetch_announcements)
+    monkeypatch.setattr(main_mod, "fetch_all_reminders", fetch_reminders)
+
+    asyncio.run(main_mod.poll_once())
+
+    assert not messages_path.exists()
+    assert "Removed legacy messages.json after successful full sync" in caplog.text
+
+
+def test_failed_full_sync_keeps_legacy_messages_json(tmp_path: Path, monkeypatch):
+    import asyncio
+    import importlib
 
     import pytest
 
-    from smartdaily_web.database import SQLiteStore
+    main_mod = importlib.import_module("smartdaily_web.main")
+    svc = PushService(data_dir=tmp_path)
+    monkeypatch.setattr(main_mod, "push_service", svc)
+    monkeypatch.setattr(main_mod, "poll_lock", asyncio.Lock())
+    monkeypatch.setattr(
+        main_mod,
+        "poll_status",
+        {"last_poll_at": None, "last_trace_id": None, "last_error": None, "is_running": False},
+    )
+    messages_path = tmp_path / "messages.json"
+    messages_path.write_text("old messages", encoding="utf-8")
 
-    store = SQLiteStore(tmp_path)
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(store.database_file) as connection:
-        connection.execute("CREATE TABLE announcements (unexpected_column TEXT)")
+    async def fail_fetch_announcements():
+        raise RuntimeError("SmartDaily unavailable")
 
-    with pytest.raises(sqlite3.OperationalError):
-        store.migrate()
+    async def fetch_reminders():
+        return []
 
-    with sqlite3.connect(store.database_file) as connection:
-        tables = {
-            row[0]
-            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        }
-    assert "messages" not in tables
-    assert "announcements" in tables
+    monkeypatch.setattr(main_mod, "fetch_all_announcements", fail_fetch_announcements)
+    monkeypatch.setattr(main_mod, "fetch_all_reminders", fetch_reminders)
 
-    with sqlite3.connect(store.database_file) as connection:
-        connection.execute("DROP TABLE announcements")
-    store.migrate()
+    with pytest.raises(RuntimeError, match="SmartDaily unavailable"):
+        asyncio.run(main_mod.poll_once())
 
-    with sqlite3.connect(store.database_file) as connection:
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 2
-        assert connection.execute("SELECT COUNT(*) FROM sync_state").fetchone()[0] == 1
+    assert messages_path.is_file()
 
 
 def test_app_lifespan_runs_migrations_before_starting_background_poll(monkeypatch):
@@ -308,6 +491,61 @@ def test_app_lifespan_runs_migrations_before_starting_background_poll(monkeypatc
         assert calls == ["migrate", "start_poll", "cancel"]
 
     asyncio.run(scenario())
+
+
+def test_test_push_sends_only_to_the_requested_device(tmp_path: Path, monkeypatch):
+    import json
+
+    import smartdaily_web.push_service as push_module
+
+    svc = PushService(data_dir=tmp_path)
+    first = {
+        "endpoint": "https://web.push.apple.com/current-device",
+        "keys": {"p256dh": "current-key", "auth": "current-auth"},
+    }
+    other = {
+        "endpoint": "https://web.push.apple.com/other-device",
+        "keys": {"p256dh": "other-key", "auth": "other-auth"},
+    }
+    svc.add_subscription(first)
+    svc.add_subscription(other)
+    delivered_to: list[str] = []
+
+    def fake_webpush(**kwargs):
+        delivered_to.append(kwargs["subscription_info"]["endpoint"])
+        assert json.loads(kwargs["data"])["title"] == "測試推播"
+
+    monkeypatch.setattr(push_module, "webpush", fake_webpush)
+
+    result = svc.send_push_to_device(
+        endpoint=first["endpoint"],
+        title="測試推播",
+        body="只送目前裝置",
+    )
+
+    assert result == {"sent": 1, "failed": 0, "active_subscribers": 1}
+    assert delivered_to == [first["endpoint"]]
+
+
+def test_test_push_returns_not_found_for_an_unknown_device(tmp_path: Path, monkeypatch):
+    import asyncio
+    import importlib
+
+    import pytest
+    from fastapi import HTTPException
+
+    main_mod = importlib.import_module("smartdaily_web.main")
+    svc = PushService(data_dir=tmp_path)
+    monkeypatch.setattr(main_mod, "push_service", svc)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            main_mod.send_test_push(
+                main_mod.TestPushPayload(endpoint="https://web.push.apple.com/unknown")
+            )
+        )
+
+    assert exc_info.value.status_code == 404
 
 
 def test_push_service_vapid_and_per_device_push_tracking(tmp_path: Path, monkeypatch):
@@ -685,14 +923,18 @@ def test_recalled_message_is_deleted_and_merged_for_display(tmp_path: Path):
         downloaded_files={1: ("1_notice.pdf", b"%PDF-1.4 dummy")},
     )
     assert len(saved_atts) == 1
-    assert saved_atts[0]["url"] == "/api/attachments/101/1_notice.pdf"
-    local_path = svc.get_attachment_file_path("101", "1_notice.pdf")
+    stored_filename = saved_atts[0]["url"].rsplit("/", 1)[-1]
+    assert saved_atts[0]["url"] == f"/api/attachments/{stored_filename}"
+    assert len(stored_filename) == 36
+    assert (tmp_path / "attachments" / stored_filename).is_file()
+    local_path = svc.get_attachment_file_path(stored_filename)
     assert local_path is not None and local_path.read_bytes() == b"%PDF-1.4 dummy"
 
     detail_with_att = svc.get_stored_announcement_detail("101")
     assert detail_with_att is not None
     assert detail_with_att["attachment_count"] == 1
-    assert detail_with_att["attachments"][0]["url"] == "/api/attachments/101/1_notice.pdf"
+    assert detail_with_att["attachments"][0]["url"] == f"/api/attachments/{stored_filename}"
+    assert detail_with_att["attachments"][0]["filename"] == "notice.pdf"
 
 
 def test_poll_once_trace_id_in_logs(tmp_path: Path, monkeypatch, caplog):
@@ -865,7 +1107,9 @@ def test_manual_poll_schedules_once_and_skips_when_running(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_legacy_subscription_migration_and_expired_device_cleanup(tmp_path: Path, monkeypatch):
+def test_legacy_subscription_migration_and_expired_device_cleanup(
+    tmp_path: Path, monkeypatch, caplog
+):
     import json
 
     legacy_file = tmp_path / "subscriptions.json"
@@ -886,9 +1130,10 @@ def test_legacy_subscription_migration_and_expired_device_cleanup(tmp_path: Path
     )
 
     svc = PushService(data_dir=tmp_path)
-    assert legacy_file.exists()
+    assert not legacy_file.exists()
     subs = svc.get_subscriptions()
     assert len(subs) == 2
+    assert "Removed 1 legacy device subscription file" in caplog.text
 
     # Initialize baseline then add 1 new reminder
     svc.sync_messages(reminders=[])
@@ -1270,8 +1515,7 @@ def test_fastapi_announcement_detail_reads_local_store_and_guards_paths(
     monkeypatch.setattr(main_mod.client, "get_announcement_detail", unexpected_detail_call)
 
     # Path traversal guard must block '..' and '/'
-    assert svc.get_attachment_file_path("../etc", "passwd") is None
-    assert svc.get_attachment_file_path("101", "../secret.txt") is None
+    assert svc.get_attachment_file_path("../secret.txt") is None
 
     # Store announcement 101 locally with attachment
     svc.sync_messages(
@@ -1296,7 +1540,10 @@ def test_fastapi_announcement_detail_reads_local_store_and_guards_paths(
     assert res_backed_up["is_deleted"] is True
     assert res_backed_up["title"] == "本地已備份公告"
     assert res_backed_up["content"] == "備份內文"
-    assert res_backed_up["attachments"][0]["url"] == "/api/attachments/101/1_a.pdf"
+    stored_filename = res_backed_up["attachments"][0]["url"].rsplit("/", 1)[-1]
+    assert res_backed_up["attachments"][0]["url"] == f"/api/attachments/{stored_filename}"
+    response = asyncio.run(main_mod.serve_cached_attachment(stored_filename))
+    assert response.media_type == "application/pdf"
 
     # Unknown announcements are not fetched on demand from SmartDaily.
     with pytest.raises(HTTPException) as exc_info:
@@ -1356,6 +1603,8 @@ def test_frontend_data_endpoints_and_test_push_use_local_database(tmp_path: Path
         ],
     )
     svc.update_store_metadata(community_name="本地社區", com_id="123")
+    current_endpoint = "https://web.push.apple.com/current-browser"
+    svc.add_subscription({"endpoint": current_endpoint, "keys": {"p256dh": "key", "auth": "auth"}})
 
     async def unexpected_smartdaily_call(*_args, **_kwargs):
         raise AssertionError("frontend data endpoints must not call SmartDaily")
@@ -1376,8 +1625,14 @@ def test_frontend_data_endpoints_and_test_push_use_local_database(tmp_path: Path
         pushed.update(kwargs)
         return {"sent": 0, "failed": 0, "active_subscribers": 0}
 
-    monkeypatch.setattr(svc, "send_push_to_all", fake_test_push)
-    test_result = asyncio.run(main_mod.send_test_push())
+    def unexpected_broadcast(**_kwargs):
+        raise AssertionError("test push must not broadcast to every device")
+
+    monkeypatch.setattr(svc, "send_push_to_device", fake_test_push)
+    monkeypatch.setattr(svc, "send_push_to_all", unexpected_broadcast)
+    test_result = asyncio.run(
+        main_mod.send_test_push(main_mod.TestPushPayload(endpoint=current_endpoint))
+    )
 
     assert status["community_name"] == "本地社區"
     assert ann_page["items"][0]["id"] == "101"
@@ -1385,6 +1640,7 @@ def test_frontend_data_endpoints_and_test_push_use_local_database(tmp_path: Path
     assert detail["content"] == "公告內容"
     assert test_result["body"] == "📢 最新公告：本地公告\n📬 最新提醒：有一件包裹..."
     assert pushed["title"].startswith("🔔 [推播測試] 本地社區")
+    assert pushed["endpoint"] == current_endpoint
 
 
 def test_background_detail_fetch_marks_recalled_announcement(tmp_path: Path, monkeypatch):
@@ -1422,6 +1678,23 @@ def test_frontend_ui_conventions_tabs_filters_infinite_scroll_and_emoji_spacing(
     # 2. Reminder category filter chips exist
     for filter_key in ("all", "postal", "Col", "Ann", "CommunityPushNotification", "other"):
         assert f'data-filter="{filter_key}"' in html_text
+
+
+def test_frontend_test_push_uses_only_the_current_browser_subscription():
+    index_path = (
+        Path(__file__).resolve().parent.parent / "src" / "smartdaily_web" / "static" / "index.html"
+    )
+    html_text = index_path.read_text(encoding="utf-8")
+    test_push_function = html_text.split("async function sendTestPush() {", 1)[1].split(
+        "// Event bindings", 1
+    )[0]
+
+    assert "navigator.serviceWorker.ready" in test_push_function
+    assert "registration.pushManager.getSubscription()" in test_push_function
+    assert "if (!subscription)" in test_push_function
+    assert "JSON.stringify({ endpoint: subscription.endpoint })" in test_push_function
+    assert "已發送測試推播至目前裝置" in test_push_function
+    assert "data.sent} 台裝置" not in test_push_function
 
     # 3. Infinite scroll sentinel & observer exist (manual loadMoreBtn removed)
     assert 'id="scrollSentinel"' in html_text

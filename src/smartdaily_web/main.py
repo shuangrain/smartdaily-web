@@ -220,6 +220,9 @@ async def poll_once() -> dict[str, Any]:
             for aid in push_service.get_uncached_announcement_ids():
                 await ensure_announcement_attachments_cached(aid)
 
+            if full_sync:
+                push_service.remove_legacy_messages_file_after_full_sync()
+
             push_res = await asyncio.to_thread(push_service.push_unpushed_messages)
             pushed_count = push_res.get("sent", 0)
             failed_count = push_res.get("failed", 0)
@@ -313,6 +316,7 @@ class UnsubscribePayload(BaseModel):
 
 
 class TestPushPayload(BaseModel):
+    endpoint: str
     title: str | None = None
     body: str | None = None
 
@@ -363,12 +367,13 @@ async def get_announcement_detail(announcement_id: str) -> dict[str, Any]:
     return stored
 
 
-@app.get("/api/attachments/{announcement_id}/{filename}")
-async def serve_cached_attachment(announcement_id: str, filename: str) -> FileResponse:
-    file_path = push_service.get_attachment_file_path(announcement_id, filename)
-    if not file_path:
+@app.get("/api/attachments/{stored_filename}")
+async def serve_cached_attachment(stored_filename: str) -> FileResponse:
+    file_path = push_service.get_attachment_file_path(stored_filename)
+    metadata = push_service.get_attachment_metadata(stored_filename)
+    if not file_path or not metadata:
         raise HTTPException(status_code=404, detail="找不到本地備份附件")
-    return FileResponse(file_path)
+    return FileResponse(file_path, media_type=metadata.get("mime_type") or None)
 
 
 @app.get("/api/notifications/reminders")
@@ -405,7 +410,7 @@ async def unsubscribe_push(payload: UnsubscribePayload) -> dict[str, Any]:
 
 
 @app.post("/api/push/test")
-async def send_test_push(payload: TestPushPayload | None = None) -> dict[str, Any]:
+async def send_test_push(payload: TestPushPayload) -> dict[str, Any]:
     trace_id = str(uuid.uuid4())
     token = trace_id_var.set(trace_id)
     try:
@@ -430,12 +435,15 @@ async def send_test_push(payload: TestPushPayload | None = None) -> dict[str, An
             )
 
         result = await asyncio.to_thread(
-            push_service.send_push_to_all,
+            push_service.send_push_to_device,
+            endpoint=payload.endpoint,
             title=title,
             body=body,
             url="/",
             tag="smartdaily-test",
         )
+        if result is None:
+            raise HTTPException(status_code=404, detail="此裝置尚未啟用推播通知")
         return {"ok": True, "trace_id": trace_id, **result, "title": title, "body": body}
     finally:
         trace_id_var.reset(token)

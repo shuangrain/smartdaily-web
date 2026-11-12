@@ -3,9 +3,9 @@
 ## Project Structure & Module Organization
 
 - `src/smartdaily_web/main.py` defines the FastAPI app and background polling workflow.
-- `smartdaily_client.py` handles SmartDaily requests and response normalization; `push_service.py` manages local records and Web Push delivery, while `database.py` defines the SQLite schema and migrations.
+- `smartdaily_client.py` handles SmartDaily requests and response normalization; `push_service.py` manages local records and Web Push delivery. `models.py` defines ORM tables, `database.py` provides persistence, and `migrations/versions/` contains Alembic schema changes.
 - `src/smartdaily_web/static/` contains the HTML, service worker, manifest, and icons.
-- `tests/test_app.py` contains the pytest suite. Runtime files such as the SQLite database, VAPID keys, and downloaded attachments belong under `data/`, not in source control. Legacy message and device JSON files are imported on the first database migration and retained as backups.
+- `tests/test_app.py` contains the pytest suite. Runtime files such as the SQLite database, VAPID keys, and downloaded attachments belong under `data/`, not in source control. Existing device subscriptions are copied from old JSON files once; old message JSON is rebuilt by a successful full sync. Attachments use UUID filenames under `data/attachments/`, with their original names recorded in SQLite.
 
 ## Build, Test, and Development Commands
 
@@ -21,9 +21,9 @@ Use Python 3.10+, four-space indentation, and the Ruff settings in `pyproject.to
 
 ## Testing Guidelines
 
-Use pytest with `tmp_path` for filesystem state and `monkeypatch` for external clients and push delivery. Keep tests deterministic and independent of a real SmartDaily account or network access. Cover pagination, per-device delivery/retry behavior, and SQLite reads/writes when changing those paths. Add a migration test whenever the schema or legacy import changes.
+Use pytest with `tmp_path` for filesystem state and `monkeypatch` for external clients and push delivery. Keep tests deterministic and independent of a real SmartDaily account or network access. Cover pagination, per-device delivery/retry behavior, and database reads/writes when changing those paths. Add a migration test whenever ORM models, Alembic revisions, or legacy data handling changes.
 
-For behavior changes, use red-green-refactor: add one focused test at a public behavior boundary, run it and confirm the expected failure, then make the smallest implementation that passes. Run the focused test and full suite before refactoring; rerun affected checks afterward. Documentation-only and formatting-only changes use their relevant checks, such as Ruff format, without adding behavior tests.
+For every behavior change, use red-green-refactor: add one focused test at a public behavior boundary, run it and confirm the expected failure, then make the smallest implementation that passes. Run the focused test and full suite before refactoring; rerun affected checks afterward. Documentation-only and formatting-only changes use their relevant checks, such as Ruff format.
 
 ## Commit & Pull Request Guidelines
 
@@ -31,4 +31,4 @@ Recent commits use short Conventional Commit prefixes such as `feat:`, `fix:`, `
 
 ## Security & Architecture Notes
 
-Only the background poller should call SmartDaily APIs; web routes and the frontend read locally stored data. Define schema changes as versioned migrations in `src/smartdaily_web/database.py`; startup applies pending migrations before starting the poller. Keep `DEVICE_ID`, VAPID secrets, and other credentials in environment configuration, never in commits. Do not commit runtime data or downloaded resident documents.
+Only the background poller should call SmartDaily APIs; web routes and the frontend read locally stored data. Define tables in `src/smartdaily_web/models.py` and add each schema change as a new Alembic revision under `src/smartdaily_web/migrations/versions/`; startup applies pending revisions before starting the poller. Keep `DEVICE_ID`, VAPID secrets, and other credentials in environment configuration, never in commits. Do not commit runtime data or downloaded resident documents.

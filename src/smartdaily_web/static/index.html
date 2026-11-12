@@ -818,12 +818,26 @@
 
     async function sendTestPush() {
       try {
-        const res = await fetch("/api/push/test", { method: "POST" });
+        const registration = await navigator.serviceWorker.ready;
+        const subscription = await registration.pushManager.getSubscription();
+        if (!subscription) {
+          showToast("⚠️ 請先在此裝置開啟推播通知");
+          return;
+        }
+
+        const res = await fetch("/api/push/test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ endpoint: subscription.endpoint }),
+        });
         const data = await res.json();
-        if (data.active_subscribers === 0) {
-          showToast("⚠️ 尚未有任何訂閱裝置，請先點擊「開啟推播通知」");
+        if (!res.ok) {
+          throw new Error(data.detail || "目前裝置無法接收推播");
+        }
+        if (data.sent === 1) {
+          showToast("📨 已發送測試推播至目前裝置！");
         } else {
-          showToast(`📨 已發送測試推播至 ${data.sent} 台裝置！`);
+          showToast("⚠️ 目前裝置未能接收測試推播");
         }
       } catch (e) {
         showToast("發送失敗：" + e.message);
