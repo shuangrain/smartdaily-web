@@ -372,9 +372,7 @@
     <div id="contentArea" class="card-list">
       <div class="empty-state">載入資料中...</div>
     </div>
-    <div id="loadMoreWrap" style="text-align:center; margin-top:16px; display:none;">
-      <button class="btn" id="loadMoreBtn" style="width:100%; justify-content:center; padding:12px;">⬇️ 載入更多</button>
-    </div>
+    <div id="scrollSentinel" style="text-align:center; margin-top:18px; padding:10px; font-size:0.84rem; color:var(--muted); display:none;"></div>
   </main>
 
   <div class="modal-backdrop" id="detailModal">
@@ -404,6 +402,8 @@
     let nextBeforeDatetime = "";
     let hasMoreData = false;
     let isLoadingMore = false;
+    let autoLoadErrorPaused = false;
+    let loadGeneration = 0;
 
     function showToast(msg) {
       const t = document.getElementById("toast");
@@ -443,20 +443,46 @@
       }
     }
 
-    function updateLoadMoreButton() {
-      const wrap = document.getElementById("loadMoreWrap");
-      const btn = document.getElementById("loadMoreBtn");
-      wrap.style.display = hasMoreData ? "block" : "none";
-      btn.disabled = isLoadingMore;
-      btn.textContent = isLoadingMore ? "⏳ 載入中..." : "⬇️ 載入更多";
+    function updateScrollSentinel() {
+      const sentinel = document.getElementById("scrollSentinel");
+      const hasCards = document.querySelectorAll("#contentArea .card").length > 0;
+      if (isLoadingMore) {
+        sentinel.style.display = "block";
+        sentinel.textContent = "⏳ 載入更多中...";
+      } else if (hasMoreData) {
+        sentinel.style.display = "block";
+        sentinel.textContent = autoLoadErrorPaused
+          ? "⚠️ 載入失敗，繼續下滑將自動重試"
+          : "⬇️ 向下滑動自動載入更多";
+      } else if (hasCards) {
+        sentinel.style.display = "block";
+        sentinel.textContent = "— 已顯示全部紀錄 —";
+      } else {
+        sentinel.style.display = "none";
+        sentinel.textContent = "";
+      }
+    }
+
+    function maybeAutoLoadMore() {
+      if (!hasMoreData || isLoadingMore || autoLoadErrorPaused) return;
+      const sentinel = document.getElementById("scrollSentinel");
+      if (!sentinel || sentinel.style.display === "none") return;
+      const rect = sentinel.getBoundingClientRect();
+      if (rect.top <= window.innerHeight + 260) {
+        loadTabContent(currentTab, true);
+      }
     }
 
     async function loadTabContent(tab, append = false) {
+      if (append && (isLoadingMore || !hasMoreData)) return;
+      const gen = append ? loadGeneration : ++loadGeneration;
       if (!append) {
         currentTab = tab;
         currentOffset = 0;
         nextBeforeDatetime = "";
         hasMoreData = false;
+        isLoadingMore = false;
+        autoLoadErrorPaused = false;
         if (tab === "reminders") {
           loadedReminders = [];
         }
@@ -465,16 +491,18 @@
         });
         document.getElementById("reminderFilterBar").classList.toggle("visible", tab === "reminders");
         document.getElementById("contentArea").innerHTML = `<div class="empty-state">載入中...</div>`;
-        updateLoadMoreButton();
+        updateScrollSentinel();
       } else {
         isLoadingMore = true;
-        updateLoadMoreButton();
+        autoLoadErrorPaused = false;
+        updateScrollSentinel();
       }
 
       try {
         if (tab === "announcements") {
           const res = await fetch(`/api/announcements?offset=${currentOffset}&max_count=10`);
           const data = await res.json();
+          if (gen !== loadGeneration) return;
           const items = data.items || [];
           hasMoreData = Boolean(data.has_more);
           currentOffset += 10;
@@ -483,6 +511,7 @@
           const q = nextBeforeDatetime ? `?before_datetime=${encodeURIComponent(nextBeforeDatetime)}` : "";
           const res = await fetch(`/api/notifications/reminders${q}`);
           const data = await res.json();
+          if (gen !== loadGeneration) return;
           const items = data.items || [];
           hasMoreData = Boolean(data.has_more);
           nextBeforeDatetime = data.next_before_datetime || "";
@@ -490,14 +519,19 @@
           renderReminders();
         }
       } catch (err) {
+        if (gen !== loadGeneration) return;
         if (!append) {
           document.getElementById("contentArea").innerHTML = `<div class="empty-state">載入失敗：${err.message}</div>`;
         } else {
+          autoLoadErrorPaused = true;
           showToast("載入更多失敗：" + err.message);
         }
       } finally {
-        isLoadingMore = false;
-        updateLoadMoreButton();
+        if (gen === loadGeneration) {
+          isLoadingMore = false;
+          updateScrollSentinel();
+          requestAnimationFrame(maybeAutoLoadMore);
+        }
       }
     }
 
@@ -792,6 +826,8 @@
           c.classList.toggle("active", c.dataset.filter === currentReminderFilter);
         });
         renderReminders();
+        updateScrollSentinel();
+        requestAnimationFrame(maybeAutoLoadMore);
       });
     });
     document.getElementById("refreshBtn").addEventListener("click", () => {
@@ -812,7 +848,25 @@
     document.getElementById("enablePushBtn").addEventListener("click", subscribeWebPush);
     document.getElementById("disablePushBtn").addEventListener("click", unsubscribeWebPush);
     document.getElementById("testPushBtn").addEventListener("click", sendTestPush);
-    document.getElementById("loadMoreBtn").addEventListener("click", () => loadTabContent(currentTab, true));
+    window.addEventListener(
+      "scroll",
+      () => {
+        if (autoLoadErrorPaused) autoLoadErrorPaused = false;
+        maybeAutoLoadMore();
+      },
+      { passive: true }
+    );
+    if ("IntersectionObserver" in window) {
+      const sentinelObserver = new IntersectionObserver(
+        (entries) => {
+          if (entries.some((e) => e.isIntersecting)) {
+            maybeAutoLoadMore();
+          }
+        },
+        { rootMargin: "260px" }
+      );
+      sentinelObserver.observe(document.getElementById("scrollSentinel"));
+    }
     document.getElementById("pollNowBtn").addEventListener("click", async () => {
       const res = await fetch("/api/poll-now", { method: "POST" });
       const data = await res.json();
