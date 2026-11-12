@@ -1501,6 +1501,7 @@ def test_fastapi_announcement_detail_reads_local_store_and_guards_paths(
 ):
     import asyncio
     import importlib
+    from urllib.parse import unquote
 
     import pytest
     from fastapi import HTTPException
@@ -1528,7 +1529,12 @@ def test_fastapi_announcement_detail_reads_local_store_and_guards_paths(
             "title": "本地已備份公告",
             "content": "備份內文",
             "attachments": [
-                {"index": 1, "url": "https://example.com/a.pdf", "type": "pdf", "filename": "a.pdf"}
+                {
+                    "index": 1,
+                    "url": "https://example.com/a.pdf",
+                    "type": "pdf",
+                    "filename": "社區公告.pdf",
+                }
             ],
         },
         downloaded_files={1: ("1_a.pdf", b"%PDF-1.4")},
@@ -1544,6 +1550,14 @@ def test_fastapi_announcement_detail_reads_local_store_and_guards_paths(
     assert res_backed_up["attachments"][0]["url"] == f"/api/attachments/{stored_filename}"
     response = asyncio.run(main_mod.serve_cached_attachment(stored_filename))
     assert response.media_type == "application/pdf"
+    content_disposition = response.headers["content-disposition"]
+    assert content_disposition.startswith("inline;")
+    assert "filename*=utf-8''" in content_disposition.lower()
+    assert 'filename="download.pdf"' in content_disposition
+    filename_marker = "filename*=utf-8''"
+    marker_position = content_disposition.lower().index(filename_marker) + len(filename_marker)
+    encoded_filename = content_disposition[marker_position:]
+    assert unquote(encoded_filename) == "社區公告.pdf"
 
     # Unknown announcements are not fetched on demand from SmartDaily.
     with pytest.raises(HTTPException) as exc_info:

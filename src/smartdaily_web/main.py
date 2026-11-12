@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -373,7 +374,28 @@ async def serve_cached_attachment(stored_filename: str) -> FileResponse:
     metadata = push_service.get_attachment_metadata(stored_filename)
     if not file_path or not metadata:
         raise HTTPException(status_code=404, detail="找不到本地備份附件")
-    return FileResponse(file_path, media_type=metadata.get("mime_type") or None)
+    original_name = str(metadata.get("original_name") or stored_filename)
+    original_name = original_name.replace("\\", "/").rsplit("/", 1)[-1] or stored_filename
+    original_name = (
+        "".join(
+            character
+            for character in original_name
+            if ord(character) >= 32 and ord(character) != 127
+        )
+        or stored_filename
+    )
+    fallback_name = original_name
+    if not original_name.isascii():
+        suffix = Path(original_name).suffix
+        fallback_name = f"download{suffix}" if suffix.isascii() else "download"
+    fallback_name = fallback_name.replace("\\", "\\\\").replace('"', '\\"')
+    encoded_name = quote(original_name, safe="!#$&+-.^_`|~")
+    content_disposition = f"inline; filename=\"{fallback_name}\"; filename*=UTF-8''{encoded_name}"
+    return FileResponse(
+        file_path,
+        media_type=metadata.get("mime_type") or None,
+        headers={"Content-Disposition": content_disposition},
+    )
 
 
 @app.get("/api/notifications/reminders")
