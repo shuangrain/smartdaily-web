@@ -244,11 +244,14 @@ async def get_announcement_detail(announcement_id: str) -> dict[str, Any]:
 
     try:
         detail = await client.get_announcement_detail(announcement_id)
-        if not detail.get("title") and not detail.get("content") and stored:
-            return (
-                push_service.get_stored_announcement_detail(announcement_id, mark_deleted=True)
-                or stored
-            )
+        if detail.get("is_deleted") or (not detail.get("title") and not detail.get("content")):
+            if stored:
+                return (
+                    push_service.get_stored_announcement_detail(announcement_id, mark_deleted=True)
+                    or stored
+                )
+            detail["is_deleted"] = True
+            return detail
         if stored and stored.get("attachments_cached"):
             detail["attachments"] = stored["attachments"]
             detail["attachment_count"] = len(stored["attachments"])

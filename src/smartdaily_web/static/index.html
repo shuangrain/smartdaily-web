@@ -583,12 +583,23 @@
 
       try {
         const res = await fetch(`/api/announcements/${encodeURIComponent(id)}`);
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
         const detail = await res.json();
         const isDeleted = Boolean(detail.is_deleted || fallbackAnn?.is_deleted);
-        const deletedBadge = isDeleted ? `<span class="badge badge-deleted">🗑️ 已回收</span> ` : "";
-        titleEl.textContent = detail.title || fallbackAnn?.title || "";
-        metaEl.innerHTML = `${deletedBadge}<span class="badge badge-type">${escapeHtml(detail.type_name || "公告")}</span> <span>📅 ${escapeHtml(detail.create_date || fallbackAnn?.start_date || "")}</span>`;
-        contentEl.textContent = detail.content || fallbackAnn?.content || "（本公告無文字內文，請參閱下方附件）";
+        const delText = escapeHtml(detail.error_description || "已回收");
+        const deletedBadge = isDeleted ? `<span class="badge badge-deleted">🗑️ ${delText}</span> ` : "";
+        titleEl.textContent = detail.title || fallbackAnn?.title || "公告詳情";
+        const dateLabel = detail.create_date || fallbackAnn?.create_date || fallbackAnn?.start_date || "";
+        metaEl.innerHTML = `${deletedBadge}<span class="badge badge-type">${escapeHtml(detail.type_name || "公告")}</span>${dateLabel ? ` <span>📅 ${escapeHtml(dateLabel)}</span>` : ""}`;
+        if (detail.content || fallbackAnn?.content) {
+          contentEl.textContent = detail.content || fallbackAnn?.content;
+        } else if (detail.error_description) {
+          contentEl.textContent = `⚠️ 智生活雲端回應：「${detail.error_description}」\n\n此公告於本服務部署前已由社區下架或刪除回收，因此智生活雲端與本地皆無留存原始內文與附件。`;
+        } else {
+          contentEl.textContent = "（本公告無文字內文，請參閱下方附件）";
+        }
 
         if (detail.attachments && detail.attachments.length > 0) {
           attachBox.style.display = "block";
@@ -684,7 +695,12 @@
           ${imagesHtml}
         `;
         if (item.feature_name === "Ann" && item.target_id) {
-          card.addEventListener("click", () => openAnnouncementDetail(item.target_id, { title: item.body }));
+          card.addEventListener("click", () =>
+            openAnnouncementDetail(item.target_id, {
+              title: item.body,
+              create_date: localTime,
+            })
+          );
         }
         container.appendChild(card);
       });

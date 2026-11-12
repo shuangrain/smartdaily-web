@@ -195,7 +195,7 @@ class SmartdailyClient:
             "com_id": com_id,
             "offset": offset,
             "max_count": max_count,
-            "has_more": len(filtered) >= max_count,
+            "has_more": len(raw_list) >= max_count,
             "total_count": len(items),
             "latest": latest_item,
             "items": items,
@@ -217,8 +217,27 @@ class SmartdailyClient:
                     params={"com_id": com_id, "id": announcement_id},
                     headers=self._kingnet_headers(),
                 )
+            if resp.status_code == 404:
+                err_desc = "公告已下架或不存在"
+                try:
+                    err_msg = resp.json().get("ErrorMessage") or {}
+                    if err_msg.get("Description"):
+                        err_desc = str(err_msg["Description"])
+                except Exception:
+                    pass
+                return {
+                    "id": str(announcement_id),
+                    "title": "",
+                    "type_name": "公告",
+                    "create_date": "",
+                    "content": "",
+                    "attachments": [],
+                    "attachment_count": 0,
+                    "is_deleted": True,
+                    "error_description": err_desc,
+                }
             resp.raise_for_status()
-            data = resp.json().get("Data", {})
+            data = resp.json().get("Data") or {}
 
         raw_content = data.get("Content") or data.get("Detail") or ""
         attached = data.get("AttachedFile") or []
