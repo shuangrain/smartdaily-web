@@ -368,7 +368,7 @@ async def get_announcement_detail(announcement_id: str) -> dict[str, Any]:
     return stored
 
 
-@app.get("/api/attachments/{stored_filename}")
+@app.get("/attachments/{stored_filename}")
 async def serve_cached_attachment(stored_filename: str) -> FileResponse:
     file_path = push_service.get_attachment_file_path(stored_filename)
     metadata = push_service.get_attachment_metadata(stored_filename)

@@ -838,7 +838,7 @@ class PushService:
                                 "stored_filename": stored_filename,
                                 "local_file": stored_filename,
                                 "mime_type": mime_type,
-                                "url": f"/api/attachments/{stored_filename}",
+                                "url": f"/attachments/{stored_filename}",
                             }
                         )
                     saved_attachments.append(att_copy)

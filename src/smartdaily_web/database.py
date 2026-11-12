@@ -316,7 +316,7 @@ class SQLiteStore:
                             "stored_filename": stored_filename,
                             "local_file": stored_filename,
                             "mime_type": mime_type,
-                            "url": f"/api/attachments/{stored_filename}",
+                            "url": f"/attachments/{stored_filename}",
                         }
                     )
                     attachment.metadata_json = _json_dump(metadata)
@@ -683,7 +683,7 @@ class SQLiteStore:
                     "original_name": record.original_name,
                     "stored_filename": record.stored_filename,
                     "mime_type": record.mime_type,
-                    "url": f"/api/attachments/{record.stored_filename}",
+                    "url": f"/attachments/{record.stored_filename}",
                 }
             )
         return metadata

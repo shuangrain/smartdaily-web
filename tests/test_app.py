@@ -153,7 +153,7 @@ def test_sqlite_baselines_legacy_device_without_delivery_history(tmp_path: Path)
 
 def test_sqlite_round_trips_typed_messages_and_attachments(tmp_path: Path):
     svc = PushService(data_dir=tmp_path)
-    archive_attachment = {"name": "notice.pdf", "local_url": "/api/attachments/a-1/notice.pdf"}
+    archive_attachment = {"name": "notice.pdf", "local_url": "/attachments/a-1/notice.pdf"}
     source_attachment = {"url": "https://example.test/photo.jpg", "mime_type": "image/jpeg"}
     messages = [
         {
@@ -252,7 +252,7 @@ def test_startup_flattens_existing_announcement_attachment_files(tmp_path: Path,
     assert detail is not None
     attachment = detail["attachments"][0]
     stored_filename = attachment["url"].rsplit("/", 1)[-1]
-    assert attachment["url"] == f"/api/attachments/{stored_filename}"
+    assert attachment["url"] == f"/attachments/{stored_filename}"
     assert attachment["filename"] == "notice.pdf"
     assert not legacy_path.exists()
     flattened_path = migrated.get_attachment_file_path(stored_filename)
@@ -924,7 +924,7 @@ def test_recalled_message_is_deleted_and_merged_for_display(tmp_path: Path):
     )
     assert len(saved_atts) == 1
     stored_filename = saved_atts[0]["url"].rsplit("/", 1)[-1]
-    assert saved_atts[0]["url"] == f"/api/attachments/{stored_filename}"
+    assert saved_atts[0]["url"] == f"/attachments/{stored_filename}"
     assert len(stored_filename) == 36
     assert (tmp_path / "attachments" / stored_filename).is_file()
     local_path = svc.get_attachment_file_path(stored_filename)
@@ -933,7 +933,7 @@ def test_recalled_message_is_deleted_and_merged_for_display(tmp_path: Path):
     detail_with_att = svc.get_stored_announcement_detail("101")
     assert detail_with_att is not None
     assert detail_with_att["attachment_count"] == 1
-    assert detail_with_att["attachments"][0]["url"] == f"/api/attachments/{stored_filename}"
+    assert detail_with_att["attachments"][0]["url"] == f"/attachments/{stored_filename}"
     assert detail_with_att["attachments"][0]["filename"] == "notice.pdf"
 
 
@@ -1510,6 +1510,10 @@ def test_fastapi_announcement_detail_reads_local_store_and_guards_paths(
     svc = PushService(data_dir=tmp_path)
     monkeypatch.setattr(main_mod, "push_service", svc)
 
+    attachment_routes = {route.path for route in main_mod.app.routes}
+    assert "/attachments/{stored_filename}" in attachment_routes
+    assert "/api/attachments/{stored_filename}" not in attachment_routes
+
     async def unexpected_detail_call(_announcement_id: str):
         raise AssertionError("announcement detail endpoint must read the local archive")
 
@@ -1547,7 +1551,7 @@ def test_fastapi_announcement_detail_reads_local_store_and_guards_paths(
     assert res_backed_up["title"] == "本地已備份公告"
     assert res_backed_up["content"] == "備份內文"
     stored_filename = res_backed_up["attachments"][0]["url"].rsplit("/", 1)[-1]
-    assert res_backed_up["attachments"][0]["url"] == f"/api/attachments/{stored_filename}"
+    assert res_backed_up["attachments"][0]["url"] == f"/attachments/{stored_filename}"
     response = asyncio.run(main_mod.serve_cached_attachment(stored_filename))
     assert response.media_type == "application/pdf"
     content_disposition = response.headers["content-disposition"]
@@ -1692,6 +1696,9 @@ def test_frontend_ui_conventions_tabs_filters_infinite_scroll_and_emoji_spacing(
     # 2. Reminder category filter chips exist
     for filter_key in ("all", "postal", "Col", "Ann", "CommunityPushNotification", "other"):
         assert f'data-filter="{filter_key}"' in html_text
+
+    assert "目前只有提醒中的摘要，沒有公告全文或附件。" in html_text
+    assert "本機只保存了提醒中的摘要" not in html_text
 
 
 def test_frontend_test_push_uses_only_the_current_browser_subscription():

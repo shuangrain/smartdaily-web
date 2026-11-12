@@ -593,7 +593,7 @@
         metaEl.innerHTML = `${deletedBadge}<span class="badge badge-type">${escapeHtml(detail.type_name || "公告")}</span>${dateLabel ? ` <span>📅 ${escapeHtml(dateLabel)}</span>` : ""}`;
         if (detail.detail_unavailable) {
           contentEl.textContent = detail.content
-            ? `${detail.content}\n\n本機只保存了提醒中的摘要，沒有這則公告的完整內容或附件。`
+            ? `${detail.content}\n\n目前只有提醒中的摘要，沒有公告全文或附件。`
             : "本機只保存了這則提醒，沒有這則公告的完整內容或附件。";
         } else if (detail.content || fallbackAnn?.content) {
           contentEl.textContent = detail.content || fallbackAnn?.content;
