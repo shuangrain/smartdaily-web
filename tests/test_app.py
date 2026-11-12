@@ -258,3 +258,323 @@ def test_poll_once_trace_id_in_logs(tmp_path: Path, monkeypatch, caplog):
     assert any("Poll started" in m for m in messages)
     assert any("Polled 1 announcements, 1 reminders" in m for m in messages)
     assert any("Poll completed:" in m for m in messages)
+
+
+def test_legacy_subscription_migration_and_expired_device_cleanup(tmp_path: Path, monkeypatch):
+    import json
+
+    legacy_file = tmp_path / "subscriptions.json"
+    legacy_file.write_text(
+        json.dumps(
+            [
+                {
+                    "endpoint": "https://web.push.apple.com/legacy-1",
+                    "keys": {"p256dh": "k1", "auth": "a1"},
+                },
+                {
+                    "endpoint": "https://web.push.apple.com/legacy-2",
+                    "keys": {"p256dh": "k2", "auth": "a2"},
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    svc = PushService(data_dir=tmp_path)
+    assert not legacy_file.exists()
+    subs = svc.get_subscriptions()
+    assert len(subs) == 2
+
+    # Initialize baseline then add 1 new reminder
+    svc.sync_messages(reminders=[])
+    svc.sync_messages(
+        reminders=[
+            {
+                "id": "rem-exp-1",
+                "feature_name": "Col",
+                "title": "寄放物領取通知",
+                "body": "您有寄放物",
+            }
+        ]
+    )
+
+    # Simulate legacy-1 returning 'expired' (410 Gone) and legacy-2 succeeding
+    def fake_send(sub, msg):
+        if sub["endpoint"].endswith("legacy-1"):
+            return "expired"
+        return "sent"
+
+    monkeypatch.setattr(svc, "_send_single_push", fake_send)
+    res = svc.push_unpushed_messages()
+    assert res["sent"] == 1
+    assert res["failed"] == 1
+    assert res["active_subscribers"] == 1
+    remaining = svc.get_subscriptions()
+    assert len(remaining) == 1
+    assert remaining[0]["endpoint"].endswith("legacy-2")
+
+
+def test_reminder_iso_timestamp_pagination_cutoff_and_recall_detection(tmp_path: Path):
+    svc = PushService(data_dir=tmp_path)
+    # Initial 10 reminders on page 1 (t01 oldest .. t10 newest)
+    initial_reminders = [
+        {
+            "id": f"uuid-{i:02d}",
+            "pushing_time": f"2026-11-10T10:{i:02d}:00.000000Z",
+            "feature_name": "CommunityPushNotification" if i == 10 else "postal",
+            "title": f"提醒 {i}",
+            "body": f"內容 {i}",
+            "files": [{"url": "https://example.com/img10.jpg", "mime_type": "image/jpeg"}]
+            if i == 10
+            else [],
+        }
+        for i in range(10, 0, -1)
+    ]
+    svc.sync_messages(reminders=initial_reminders)
+
+    # Next poll:
+    # - uuid-11 arrives at 10:11
+    # - uuid-09 (10:09) was recalled/deleted!
+    # - uuid-01 (10:01) was pushed to page 2 (cutoff is uuid-02 at 10:02)
+    next_page1 = [
+        {
+            "id": "uuid-11",
+            "pushing_time": "2026-11-10T10:11:00.000000Z",
+            "feature_name": "postal",
+            "title": "提醒 11",
+            "body": "內容 11",
+            "files": [],
+        },
+        {
+            "id": "uuid-10",
+            "pushing_time": "2026-11-10T10:10:00.000000Z",
+            "feature_name": "CommunityPushNotification",
+            "title": "提醒 10",
+            "body": "內容 10",
+            "files": [],  # Even if empty on a later sync, previously enriched files are preserved
+        },
+    ] + [
+        {
+            "id": f"uuid-{i:02d}",
+            "pushing_time": f"2026-11-10T10:{i:02d}:00.000000Z",
+            "feature_name": "postal",
+            "title": f"提醒 {i}",
+            "body": f"內容 {i}",
+            "files": [],
+        }
+        for i in range(8, 0, -1)
+    ]
+    # Replace last item (uuid-01) with uuid-08b at 10:08:30 so cutoff is 10:02
+    next_page1[-1] = {
+        "id": "uuid-08b",
+        "pushing_time": "2026-11-10T10:08:30.000000Z",
+        "feature_name": "postal",
+        "title": "提醒 8b",
+        "body": "內容 8b",
+        "files": [],
+    }
+    assert len(next_page1) == 10
+
+    merged = svc.merge_with_deleted_items("reminder", next_page1, is_first_page=True)
+    by_id = {m["id"]: m for m in svc.get_messages()}
+    # uuid-09 (10:09 >= cutoff 10:02) was recalled -> is_deleted=True
+    assert by_id["uuid-09"]["is_deleted"] is True
+    # uuid-01 (10:01 < cutoff 10:02) was merely pushed to page 2 -> is_deleted=False!
+    assert by_id["uuid-01"]["is_deleted"] is False
+    # uuid-10 preserved its enriched image files
+    assert len(by_id["uuid-10"]["item"]["files"]) == 1
+    # Merged first-page result includes recalled uuid-09 sorted in chronological order
+    merged_ids = [m["id"] for m in merged]
+    assert "uuid-09" in merged_ids
+    assert "uuid-01" not in merged_ids
+
+
+def test_smartdaily_client_pagination_404_detail_and_reminder_files(monkeypatch):
+    import asyncio
+
+    import httpx
+
+    from smartdaily_web.smartdaily_client import SmartdailyClient
+
+    client = SmartdailyClient(device_id="dummy-device", com_id="25122307")
+    client._raw_token = "valid-token"
+    client._token_expires_mono = 999999999.0
+    client._community_name = "測試社區"
+
+    async def fake_get(self, url: str, params=None, headers=None):
+        req = httpx.Request("GET", url, params=params)
+        if "Announcement/Community/List" in url:
+            # 10 raw items: 1 platform ad (ComId="") + 9 community announcements
+            anns = [{"Id": "ad-1", "ComId": "", "Title": "平台團購廣告"}] + [
+                {
+                    "Id": f"ann-{i}",
+                    "ComId": "25122307",
+                    "Title": f"社區公告 {i}",
+                    "CreateDate": "2026-10-27",
+                }
+                for i in range(9)
+            ]
+            return httpx.Response(200, json={"Data": {"Announcements": anns}}, request=req)
+        if "Announcement/Detail" in url:
+            if params and params.get("id") == "2610272893":
+                return httpx.Response(
+                    404,
+                    json={
+                        "Status": 0,
+                        "ErrorMessage": {"Code": 404000, "Description": "公告已下架"},
+                    },
+                    request=req,
+                )
+        if "Message/Notification/List" in url:
+            return httpx.Response(
+                200,
+                json={
+                    "Data": {
+                        "Messages": [
+                            {
+                                "MessageType": "CommunityPushNotification",
+                                "CommunityPushNotificationId": "590127",
+                                "Community": "測試社區",
+                                "Content": "有附圖的個人通知",
+                                "Files": [
+                                    {
+                                        "Url": "https://example.com/photo.jpg",
+                                        "MimeType": "image/jpeg",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                },
+                request=req,
+            )
+        return httpx.Response(200, json={"Data": {}}, request=req)
+
+    async def fake_post(self, url: str, json=None, headers=None):
+        req = httpx.Request("POST", url)
+        if "NotificationBox/LoadNotices" in url:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "Id": "rem-notif-1",
+                        "PushingTime": "2026-11-12T10:00:00Z",
+                        "HasRead": False,
+                        "Message": {
+                            "Title": "個人通知",
+                            "Body": "有附圖的個人通知",
+                            "Data": {
+                                "FeatureName": "CommunityPushNotification",
+                                "Id": "590127",
+                            },
+                        },
+                    }
+                ],
+                request=req,
+            )
+        return httpx.Response(200, json={}, request=req)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    # 1. Verify get_announcements keeps has_more=True even when 1 ad is filtered out of 10 raw items
+    ann_res = asyncio.run(client.get_announcements(offset=0, max_count=10))
+    assert len(ann_res["items"]) == 9
+    assert ann_res["has_more"] is True
+
+    # 2. Verify get_announcement_detail handles 404 (404000 公告已下架) gracefully
+    det_res = asyncio.run(client.get_announcement_detail("2610272893"))
+    assert det_res["is_deleted"] is True
+    assert det_res["error_description"] == "公告已下架"
+
+    # 3. Verify get_my_reminders enriches CommunityPushNotification with image files
+    rem_res = asyncio.run(client.get_my_reminders())
+    assert len(rem_res["items"]) == 1
+    assert rem_res["items"][0]["files"] == [
+        {"url": "https://example.com/photo.jpg", "mime_type": "image/jpeg"}
+    ]
+
+
+def test_fastapi_announcement_detail_fallback_and_path_traversal_guard(tmp_path: Path, monkeypatch):
+    import asyncio
+    import importlib
+
+    main_mod = importlib.import_module("smartdaily_web.main")
+    svc = PushService(data_dir=tmp_path)
+    monkeypatch.setattr(main_mod, "push_service", svc)
+
+    # Path traversal guard must block '..' and '/'
+    assert svc.get_attachment_file_path("../etc", "passwd") is None
+    assert svc.get_attachment_file_path("101", "../secret.txt") is None
+
+    # Store announcement 101 locally with attachment
+    svc.sync_messages(
+        announcements=[{"id": "101", "title": "本地已備份公告", "content": "備份內文"}]
+    )
+    svc.save_announcement_detail_and_attachments(
+        announcement_id="101",
+        detail={
+            "id": "101",
+            "title": "本地已備份公告",
+            "content": "備份內文",
+            "attachments": [
+                {"index": 1, "url": "https://example.com/a.pdf", "type": "pdf", "filename": "a.pdf"}
+            ],
+        },
+        downloaded_files={1: ("1_a.pdf", b"%PDF-1.4")},
+    )
+
+    async def fake_detail_404(aid: str):
+        return {
+            "id": aid,
+            "title": "",
+            "type_name": "公告",
+            "create_date": "",
+            "content": "",
+            "attachments": [],
+            "attachment_count": 0,
+            "is_deleted": True,
+            "error_description": "公告已下架",
+        }
+
+    monkeypatch.setattr(main_mod.client, "get_announcement_detail", fake_detail_404)
+
+    # Case A: Announcement 101 was backed up locally before 404 -> returns local backup
+    res_backed_up = asyncio.run(main_mod.get_announcement_detail("101"))
+    assert res_backed_up["is_deleted"] is True
+    assert res_backed_up["title"] == "本地已備份公告"
+    assert res_backed_up["content"] == "備份內文"
+    assert res_backed_up["attachments"][0]["url"] == "/api/attachments/101/1_a.pdf"
+
+    # Case B: Announcement 2610272893 was unpublished before service deployed (not in messages.json)
+    res_unbacked = asyncio.run(main_mod.get_announcement_detail("2610272893"))
+    assert res_unbacked["is_deleted"] is True
+    assert res_unbacked["error_description"] == "公告已下架"
+
+
+def test_frontend_ui_conventions_tabs_filters_infinite_scroll_and_emoji_spacing():
+    index_path = (
+        Path(__file__).resolve().parent.parent / "src" / "smartdaily_web" / "static" / "index.html"
+    )
+    html_text = index_path.read_text(encoding="utf-8")
+
+    # 1. Only announcements and reminders tabs exist (personal tab removed)
+    assert 'data-tab="announcements"' in html_text
+    assert 'data-tab="reminders"' in html_text
+    assert 'data-tab="personal"' not in html_text
+
+    # 2. Reminder category filter chips exist
+    for filter_key in ("all", "postal", "Col", "Ann", "CommunityPushNotification", "other"):
+        assert f'data-filter="{filter_key}"' in html_text
+
+    # 3. Infinite scroll sentinel & observer exist (manual loadMoreBtn removed)
+    assert 'id="scrollSentinel"' in html_text
+    assert "IntersectionObserver" in html_text
+    assert "maybeAutoLoadMore" in html_text
+    assert 'id="loadMoreBtn"' not in html_text
+
+    # 4. Emoji spacing: strictly 1 half-width space in '🗑️ 已回收', never double-space or zero-space
+    assert "🗑️ 已回收" in html_text
+    assert "🗑  已回收" not in html_text
+    assert "🗑️  已回收" not in html_text
+    assert "🗑️已回收" not in html_text
