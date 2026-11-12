@@ -45,6 +45,26 @@ poll_status: dict[str, Any] = {
 poll_lock = asyncio.Lock()
 
 
+async def ensure_announcement_attachments_cached(announcement_id: str) -> dict[str, Any] | None:
+    """Fetch announcement detail and download/backup attachments to local storage."""
+    try:
+        detail = await client.get_announcement_detail(announcement_id)
+        if not detail.get("title") and not detail.get("content"):
+            return None
+        downloaded = await client.download_attachment_files(detail.get("attachments", []))
+        saved_atts = push_service.save_announcement_detail_and_attachments(
+            announcement_id=announcement_id,
+            detail=detail,
+            downloaded_files=downloaded,
+        )
+        detail["attachments"] = saved_atts
+        detail["attachment_count"] = len(saved_atts)
+        return detail
+    except Exception as exc:
+        logger.debug("Could not cache attachments for announcement %s: %s", announcement_id, exc)
+        return None
+
+
 async def poll_once() -> dict[str, Any]:
     """Fetch latest announcements, personal notifications, and reminders and push any new items."""
     async with poll_lock:
@@ -70,6 +90,10 @@ async def poll_once() -> dict[str, Any]:
             )
             for ev in events:
                 logger.info("New %s recorded (%s): %s", ev["type"], ev["id"], ev["title"])
+
+            # Back up attachments for any announcements not yet cached locally
+            for aid in push_service.get_uncached_announcement_ids():
+                await ensure_announcement_attachments_cached(aid)
 
             push_res = await asyncio.to_thread(push_service.push_unpushed_messages)
             pushed_count = push_res.get("sent", 0)
@@ -173,6 +197,9 @@ async def list_announcements(offset: int = 0, max_count: int = 10) -> dict[str, 
 @app.get("/api/announcements/{announcement_id}")
 async def get_announcement_detail(announcement_id: str) -> dict[str, Any]:
     stored = push_service.get_stored_announcement_detail(announcement_id)
+    if stored and stored.get("is_deleted"):
+        return stored
+
     try:
         detail = await client.get_announcement_detail(announcement_id)
         if not detail.get("title") and not detail.get("content") and stored:
@@ -180,6 +207,18 @@ async def get_announcement_detail(announcement_id: str) -> dict[str, Any]:
                 push_service.get_stored_announcement_detail(announcement_id, mark_deleted=True)
                 or stored
             )
+        if stored and stored.get("attachments_cached"):
+            detail["attachments"] = stored["attachments"]
+            detail["attachment_count"] = len(stored["attachments"])
+        else:
+            downloaded = await client.download_attachment_files(detail.get("attachments", []))
+            saved_atts = push_service.save_announcement_detail_and_attachments(
+                announcement_id=announcement_id,
+                detail=detail,
+                downloaded_files=downloaded,
+            )
+            detail["attachments"] = saved_atts
+            detail["attachment_count"] = len(saved_atts)
         detail["is_deleted"] = bool(stored.get("is_deleted")) if stored else False
         return detail
     except Exception as exc:
@@ -189,6 +228,14 @@ async def get_announcement_detail(announcement_id: str) -> dict[str, Any]:
                 or stored
             )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/attachments/{announcement_id}/{filename}")
+async def serve_cached_attachment(announcement_id: str, filename: str) -> FileResponse:
+    file_path = push_service.get_attachment_file_path(announcement_id, filename)
+    if not file_path:
+        raise HTTPException(status_code=404, detail="找不到本地備份附件")
+    return FileResponse(file_path)
 
 
 @app.get("/api/notifications/personal")

@@ -173,3 +173,31 @@ def test_recalled_message_is_deleted_and_merged_for_display(tmp_path: Path):
     assert detail is not None
     assert detail["is_deleted"] is True
     assert detail["content"] == "這則之後會被回收"
+
+    # Verify local attachment backup & retrieval even when announcement is deleted
+    saved_atts = svc.save_announcement_detail_and_attachments(
+        announcement_id="101",
+        detail={
+            "id": "101",
+            "title": "誤發的公告",
+            "content": "完整公告詳情與附件",
+            "attachments": [
+                {
+                    "index": 1,
+                    "url": "https://storage.googleapis.com/signed-url",
+                    "type": "pdf",
+                    "filename": "notice.pdf",
+                }
+            ],
+        },
+        downloaded_files={1: ("1_notice.pdf", b"%PDF-1.4 dummy")},
+    )
+    assert len(saved_atts) == 1
+    assert saved_atts[0]["url"] == "/api/attachments/101/1_notice.pdf"
+    local_path = svc.get_attachment_file_path("101", "1_notice.pdf")
+    assert local_path is not None and local_path.read_bytes() == b"%PDF-1.4 dummy"
+
+    detail_with_att = svc.get_stored_announcement_detail("101")
+    assert detail_with_att is not None
+    assert detail_with_att["attachment_count"] == 1
+    assert detail_with_att["attachments"][0]["url"] == "/api/attachments/101/1_notice.pdf"

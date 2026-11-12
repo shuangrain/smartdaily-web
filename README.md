@@ -38,6 +38,7 @@ flowchart TD
     subgraph Storage["本地持久化儲存 (/app/data)"]
         Vapid["vapid_keys.json (VAPID 公私鑰)"]
         MsgStore["messages.json (完整訊息庫 + is_deleted 狀態)"]
+        AttFiles["attachments/<ann_id>/ (公告 PDF / 圖片本地備份)"]
         DevFiles["devices/<device_id>.json (各裝置獨立已推播紀錄)"]
     end
 
@@ -46,8 +47,8 @@ flowchart TD
         DeviceB["裝置 B (電腦 / iPad 瀏覽器)"]
     end
 
-    Poller -->|"定時抓取最新訊息"| Client
-    WebUI -->|"分頁查詢 / 刷新附件簽名"| Client
+    Poller -->|"定時抓取最新訊息與附件"| Client
+    WebUI -->|"分頁查詢 / 讀取本地備份附件"| Client
     Client --> API_Auth
     Client --> API_Ann
     Client --> API_Notif
@@ -56,6 +57,7 @@ flowchart TD
     Poller -->|"同步新訊息與標記已回收訊息"| PushSvc
     WebUI -->|"合併顯示已回收訊息 (is_deleted)"| PushSvc
     PushSvc <-->|"Atomic 讀寫"| MsgStore
+    PushSvc <-->|"自動下載與讀取"| AttFiles
     PushSvc <-->|"依裝置獨立讀寫"| DevFiles
     PushSvc -->|"讀取金鑰"| Vapid
 

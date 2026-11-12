@@ -46,6 +46,8 @@ class PushService:
         self.data_dir = base_dir
         self.devices_dir = self.data_dir / "devices"
         self.devices_dir.mkdir(parents=True, exist_ok=True)
+        self.attachments_dir = self.data_dir / "attachments"
+        self.attachments_dir.mkdir(parents=True, exist_ok=True)
         self.vapid_file = self.data_dir / "vapid_keys.json"
         self.messages_file = self.data_dir / "messages.json"
         self.legacy_subs_file = self.data_dir / "subscriptions.json"
@@ -445,7 +447,12 @@ class PushService:
             mid = str(msg.get("id", ""))
             if mid in live_by_id:
                 msg["is_deleted"] = False
+                old_content = (
+                    msg["item"].get("content", "") if isinstance(msg.get("item"), dict) else ""
+                )
                 item_copy = dict(live_by_id[mid])
+                if not item_copy.get("content") and old_content:
+                    item_copy["content"] = old_content
                 item_copy["is_deleted"] = False
                 msg["item"] = item_copy
             else:
@@ -594,35 +601,116 @@ class PushService:
         combined.sort(key=lambda x: _safe_int(x.get("id")) or 0, reverse=True)
         return combined
 
+    def get_uncached_announcement_ids(self) -> list[str]:
+        """Return announcement IDs in messages.json whose attachments are not yet cached."""
+        with self._store_lock:
+            return [
+                str(m["id"])
+                for m in self.get_messages()
+                if m.get("type") == "announcement"
+                and m.get("id")
+                and not m.get("is_deleted")
+                and not m.get("attachments_cached")
+            ]
+
+    def save_announcement_detail_and_attachments(
+        self,
+        announcement_id: str,
+        detail: dict[str, Any],
+        downloaded_files: dict[int, tuple[str, bytes]],
+    ) -> list[dict[str, Any]]:
+        """
+        Save downloaded attachment binaries to data/attachments/<announcement_id>/
+        and update the announcement record in data/messages.json with local attachment URLs.
+        """
+        safe_ann_id = str(announcement_id).strip()
+        if not safe_ann_id or "/" in safe_ann_id or ".." in safe_ann_id:
+            return detail.get("attachments", [])
+
+        ann_dir = self.attachments_dir / safe_ann_id
+        if downloaded_files:
+            ann_dir.mkdir(parents=True, exist_ok=True)
+
+        saved_attachments: list[dict[str, Any]] = []
+        for att in detail.get("attachments", []):
+            idx = int(att.get("index", 1))
+            att_copy = dict(att)
+            if idx in downloaded_files:
+                local_name, file_bytes = downloaded_files[idx]
+                file_path = ann_dir / local_name
+                file_path.write_bytes(file_bytes)
+                att_copy["url"] = f"/api/attachments/{safe_ann_id}/{local_name}"
+                att_copy["local_file"] = local_name
+            saved_attachments.append(att_copy)
+
+        with self._store_lock:
+            store = self.get_message_store()
+            target_uid = f"announcement:{safe_ann_id}"
+            found = next((m for m in store["messages"] if m.get("uid") == target_uid), None)
+            if found:
+                # Mark attachments_cached=True when all attachments are downloaded
+                expected_count = len(detail.get("attachments", []))
+                found["attachments_cached"] = len(downloaded_files) >= expected_count
+                found["attachments"] = saved_attachments
+                if detail.get("content"):
+                    if not isinstance(found.get("item"), dict):
+                        found["item"] = self._reconstruct_display_item(found)
+                    found["item"]["content"] = detail["content"]
+                self.save_message_store(store)
+
+        return saved_attachments
+
+    def get_attachment_file_path(self, announcement_id: str, filename: str) -> Path | None:
+        """Resolve and validate a local attachment path under data/attachments/."""
+        if (
+            not announcement_id
+            or not filename
+            or "/" in announcement_id
+            or "\\" in announcement_id
+            or ".." in announcement_id
+            or "/" in filename
+            or "\\" in filename
+            or ".." in filename
+        ):
+            return None
+        candidate = (self.attachments_dir / announcement_id / filename).resolve()
+        base_resolved = self.attachments_dir.resolve()
+        if not str(candidate).startswith(str(base_resolved) + os.sep):
+            return None
+        return candidate if candidate.is_file() else None
+
     def get_stored_announcement_detail(
         self, announcement_id: str, mark_deleted: bool = False
     ) -> dict[str, Any] | None:
         """
-        Retrieve an announcement from messages.json (fallback when recalled from SmartDaily).
+        Retrieve an announcement from messages.json (including locally backed-up attachments).
         """
-        store = self.get_message_store()
-        target_uid = f"announcement:{announcement_id}"
-        found = next((m for m in store["messages"] if m.get("uid") == target_uid), None)
-        if not found:
-            return None
+        with self._store_lock:
+            store = self.get_message_store()
+            target_uid = f"announcement:{announcement_id}"
+            found = next((m for m in store["messages"] if m.get("uid") == target_uid), None)
+            if not found:
+                return None
 
-        if mark_deleted and not found.get("is_deleted"):
-            found["is_deleted"] = True
-            if isinstance(found.get("item"), dict):
-                found["item"]["is_deleted"] = True
-            self.save_message_store(store)
+            if mark_deleted and not found.get("is_deleted"):
+                found["is_deleted"] = True
+                if isinstance(found.get("item"), dict):
+                    found["item"]["is_deleted"] = True
+                self.save_message_store(store)
 
-        disp = self._reconstruct_display_item(found)
-        return {
-            "id": str(disp.get("id", announcement_id)),
-            "title": disp.get("title", ""),
-            "type_name": disp.get("type_name", "公告"),
-            "create_date": disp.get("create_date") or disp.get("start_date") or "",
-            "content": disp.get("content", ""),
-            "attachments": [],
-            "attachment_count": 0,
-            "is_deleted": bool(found.get("is_deleted", False)),
-        }
+            disp = self._reconstruct_display_item(found)
+            attachments = list(found.get("attachments") or [])
+            return {
+                "id": str(disp.get("id", announcement_id)),
+                "title": disp.get("title", ""),
+                "type_name": disp.get("type_name", "公告"),
+                "create_date": disp.get("create_date") or disp.get("start_date") or "",
+                "content": disp.get("content", ""),
+                "attachments": attachments,
+                "attachment_count": len(attachments),
+                "attachments_cached": bool(found.get("attachments_cached", False)),
+                "is_deleted": bool(found.get("is_deleted", False)),
+            }
 
     def check_and_record_new_items(
         self,

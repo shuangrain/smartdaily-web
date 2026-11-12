@@ -251,6 +251,30 @@ class SmartdailyClient:
             "attachment_count": len(attachments),
         }
 
+    async def download_attachment_files(
+        self, attachments: list[dict[str, Any]]
+    ) -> dict[int, tuple[str, bytes]]:
+        """Download attachment binaries from signed URLs, returning {index: (safe_name, bytes)}."""
+        downloaded: dict[int, tuple[str, bytes]] = {}
+        if not attachments:
+            return downloaded
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            for att in attachments:
+                url = att.get("url", "")
+                idx = int(att.get("index", 1))
+                raw_name = str(att.get("filename") or f"attachment_{idx}")
+                safe_name = re.sub(r"[^a-zA-Z0-9._\-\u4e00-\u9fff]", "_", raw_name)
+                local_name = f"{idx}_{safe_name}"
+                if not url or url.startswith("/api/"):
+                    continue
+                try:
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                    downloaded[idx] = (local_name, resp.content)
+                except Exception as exc:
+                    logger.warning("Failed to download attachment %s: %s", local_name, exc)
+        return downloaded
+
     async def get_personal_notifications(
         self, offset: int = 0, max_count: int = 10
     ) -> dict[str, Any]:
