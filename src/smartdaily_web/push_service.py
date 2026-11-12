@@ -68,6 +68,16 @@ def _parse_iso_ts(val: Any) -> float | None:
         return None
 
 
+def _message_is_pushable_for_device(msg: dict[str, Any], sub: dict[str, Any]) -> bool:
+    """Ignore messages before device creation; unknown timestamps use UID tracking."""
+    cutoff = _parse_iso_ts(sub.get("create_time") or sub.get("subscribed_at"))
+    if cutoff is None:
+        return True
+    item = msg.get("item") if isinstance(msg.get("item"), dict) else {}
+    message_time = _parse_iso_ts(item.get("pushing_time"))
+    return message_time is None or message_time >= cutoff
+
+
 def _atomic_write_json(path: Path, data: Any) -> None:
     """Atomically write JSON data to path via a temporary file rename."""
     tmp_path = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}")
@@ -132,20 +142,22 @@ class PushService:
     def get_message_store(self) -> dict[str, Any]:
         """Read the central message store from messages.json."""
         if not self.messages_file.is_file():
-            return {"initialized_types": [], "messages": []}
+            return {"initialized_types": [], "messages": [], "metadata": {}}
         try:
             data = json.loads(self.messages_file.read_text(encoding="utf-8"))
             if isinstance(data, list):
                 return {
                     "initialized_types": ["announcement", "personal", "reminder"],
                     "messages": data,
+                    "metadata": {},
                 }
             return {
                 "initialized_types": list(data.get("initialized_types", [])),
                 "messages": list(data.get("messages", [])),
+                "metadata": dict(data.get("metadata", {})),
             }
         except Exception:
-            return {"initialized_types": [], "messages": []}
+            return {"initialized_types": [], "messages": [], "metadata": {}}
 
     def get_messages(self) -> list[dict[str, Any]]:
         """Return all stored messages (newest first)."""
@@ -156,8 +168,50 @@ class PushService:
         payload = {
             "initialized_types": list(dict.fromkeys(store.get("initialized_types", []))),
             "messages": list(store.get("messages", [])),
+            "metadata": dict(store.get("metadata", {})),
         }
         _atomic_write_json(self.messages_file, payload)
+
+    def get_store_metadata(self) -> dict[str, Any]:
+        """Return background sync metadata persisted alongside messages."""
+        return self.get_message_store().get("metadata", {})
+
+    def update_store_metadata(self, **values: Any) -> None:
+        """Update metadata in messages.json, preserving messages and initialization state."""
+        with self._store_lock:
+            store = self.get_message_store()
+            store["metadata"].update(values)
+            self.save_message_store(store)
+
+    def get_message_page(
+        self, msg_type: str, offset: int = 0, max_count: int = 10
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Read a sorted page of display items from messages.json."""
+        with self._store_lock:
+            records = [m for m in self.get_messages() if m.get("type") == msg_type]
+            items = [self._reconstruct_display_item(m) for m in records]
+
+            if msg_type == "announcement":
+                items.sort(
+                    key=lambda item: (
+                        bool(item.get("is_top")),
+                        _safe_int(item.get("id")) or 0,
+                    ),
+                    reverse=True,
+                )
+            else:
+                items.sort(
+                    key=lambda item: (
+                        _parse_iso_ts(item.get("pushing_time")) or 0.0,
+                        _safe_int(item.get("id")) or 0,
+                    ),
+                    reverse=True,
+                )
+
+            total = len(items)
+            start = max(0, offset)
+            count = max(1, min(max_count, 100))
+            return items[start : start + count], total
 
     # -------------------------------------------------------------------------
     # Per-Device Files (data/devices/<device_id>.json)
@@ -245,7 +299,9 @@ class PushService:
             if existing and "pushed_message_uids" in existing:
                 pushed_uids = list(existing["pushed_message_uids"])
                 subscribed_at = (
-                    existing.get("subscribed_at") or datetime.now(timezone.utc).isoformat()
+                    existing.get("subscribed_at")
+                    or existing.get("create_time")
+                    or datetime.now(timezone.utc).isoformat()
                 )
             else:
                 pushed_uids = list(known_uids)
@@ -484,13 +540,15 @@ class PushService:
         msg_type: str,
         live_items: list[dict[str, Any]],
         page_size: int = 10,
+        full_sync: bool = False,
     ) -> None:
         """
         Mark stored messages of msg_type as is_deleted=True if they are missing
-        from the latest top-page response and were not merely pushed to page 2.
+        from the latest response. When full_sync=True (all pages fetched), any
+        missing stored message is marked as recalled.
         """
         live_by_id = {str(it.get("id", "")): it for it in live_items if it.get("id")}
-        has_more_pages = len(live_items) >= page_size
+        has_more_pages = False if full_sync else (len(live_items) >= page_size)
 
         # Compute minimum numeric ID or timestamp on current top page to distinguish pagination
         if msg_type == "announcement":
@@ -564,14 +622,16 @@ class PushService:
         announcements: list[dict[str, Any]] | None = None,
         personal_notifications: list[dict[str, Any]] | None = None,
         reminders: list[dict[str, Any]] | None = None,
+        full_sync: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Record fetched announcements, personal notifications, and reminders into
         the central message store (data/messages.json) without upper limit, and
         update is_deleted flags for recalled messages.
-        When a category is initialized for the first time, its current items are
-        recorded into the message store AND marked as baseline in each existing
-        device file so old historical messages do not trigger push floods.
+        When a category is initialized for the first time, or when older historical
+        messages from subsequent pages are backfilled, they are recorded into the
+        message store AND marked as baseline in each existing device file so old
+        historical messages do not trigger push floods.
         Returns the list of newly discovered non-baseline messages.
         """
         with self._store_lock:
@@ -587,30 +647,60 @@ class PushService:
                 "reminder": reminders,
             }
 
-            newly_added_chronological: list[dict[str, Any]] = []
-            new_non_baseline_events: list[dict[str, Any]] = []
+            newly_added_newer: list[dict[str, Any]] = []
+            newly_added_older: list[dict[str, Any]] = []
+            new_non_baseline_events_newest_first: list[dict[str, Any]] = []
             baseline_uids: list[str] = []
 
             for msg_type, raw_list in inputs_by_type.items():
                 if raw_list is None:
                     continue
-                self._update_deleted_flags_for_type(existing_messages, msg_type, raw_list)
+                self._update_deleted_flags_for_type(
+                    existing_messages, msg_type, raw_list, full_sync=full_sync
+                )
                 is_type_initialized = msg_type in initialized_types
 
-                for raw_item in reversed(raw_list):
+                existing_type_msgs = [m for m in existing_messages if m.get("type") == msg_type]
+                valid_existing_ts = [
+                    ts
+                    for m in existing_type_msgs
+                    if (ts := _parse_iso_ts((m.get("item") or {}).get("pushing_time"))) is not None
+                ]
+                max_existing_ts = max(valid_existing_ts) if valid_existing_ts else None
+                seen_existing_for_type = False
+
+                for raw_item in raw_list:
                     candidate = self._build_candidate_record(msg_type, raw_item, now_iso)
                     if not candidate:
                         continue
                     uid = candidate["uid"]
                     if uid not in existing_uids:
                         existing_uids.add(uid)
-                        newly_added_chronological.append(candidate)
-                        if is_type_initialized and msg_type == "reminder":
-                            new_non_baseline_events.append(candidate)
-                        else:
+                        if not is_type_initialized:
+                            newly_added_newer.append(candidate)
                             baseline_uids.append(uid)
-                    elif not is_type_initialized or msg_type != "reminder":
-                        baseline_uids.append(uid)
+                        else:
+                            cand_ts = _parse_iso_ts(raw_item.get("pushing_time"))
+                            if cand_ts is not None and max_existing_ts is not None:
+                                is_newer = cand_ts > max_existing_ts or (
+                                    cand_ts == max_existing_ts and not seen_existing_for_type
+                                )
+                            else:
+                                is_newer = not seen_existing_for_type
+
+                            if is_newer:
+                                newly_added_newer.append(candidate)
+                                if msg_type == "reminder":
+                                    new_non_baseline_events_newest_first.append(candidate)
+                                else:
+                                    baseline_uids.append(uid)
+                            else:
+                                newly_added_older.append(candidate)
+                                baseline_uids.append(uid)
+                    else:
+                        seen_existing_for_type = True
+                        if not is_type_initialized or msg_type != "reminder":
+                            baseline_uids.append(uid)
 
                 initialized_types.add(msg_type)
 
@@ -618,11 +708,12 @@ class PushService:
             for m in existing_messages:
                 m.setdefault("is_deleted", False)
 
-            updated_messages = list(reversed(newly_added_chronological)) + existing_messages
+            updated_messages = newly_added_newer + existing_messages + newly_added_older
             self.save_message_store(
                 {
                     "initialized_types": list(initialized_types),
                     "messages": updated_messages,
+                    "metadata": store.get("metadata", {}),
                 }
             )
 
@@ -648,7 +739,7 @@ class PushService:
                 except Exception:
                     pass
 
-            return new_non_baseline_events
+            return list(reversed(new_non_baseline_events_newest_first))
 
     def merge_with_deleted_items(
         self,
@@ -657,17 +748,9 @@ class PushService:
         is_first_page: bool = True,
     ) -> list[dict[str, Any]]:
         """
-        Sync first-page live items into messages.json and return a merged list
-        containing live items (is_deleted=False) and recalled items (is_deleted=True).
+        Read-only merge of live items (is_deleted=False) with recalled items
+        (is_deleted=True) stored in messages.json. Does not write to messages.json.
         """
-        if is_first_page:
-            kwargs: dict[str, Any] = {
-                "announcements": live_items if msg_type == "announcement" else None,
-                "personal_notifications": live_items if msg_type == "personal" else None,
-                "reminders": live_items if msg_type == "reminder" else None,
-            }
-            self.sync_messages(**kwargs)
-
         live_ids = {str(it.get("id", "")) for it in live_items if it.get("id")}
         result_items = [dict(it, is_deleted=False) for it in live_items]
 
@@ -711,6 +794,24 @@ class PushService:
                 and not m.get("is_deleted")
                 and not m.get("attachments_cached")
             ]
+
+    def mark_announcement_deleted(self, announcement_id: str) -> None:
+        """Mark an announcement recalled during a background detail fetch."""
+        with self._store_lock:
+            store = self.get_message_store()
+            target_uid = f"announcement:{announcement_id}"
+            found = next((m for m in store["messages"] if m.get("uid") == target_uid), None)
+            if not found or found.get("is_deleted"):
+                return
+            found["is_deleted"] = True
+            if isinstance(found.get("item"), dict):
+                found["item"]["is_deleted"] = True
+            self.save_message_store(store)
+            logger.info(
+                "Message marked as recalled (is_deleted=True): announcement (%s) %s",
+                announcement_id,
+                found.get("title", ""),
+            )
 
     def save_announcement_detail_and_attachments(
         self,
@@ -778,9 +879,7 @@ class PushService:
             return None
         return candidate if candidate.is_file() else None
 
-    def get_stored_announcement_detail(
-        self, announcement_id: str, mark_deleted: bool = False
-    ) -> dict[str, Any] | None:
+    def get_stored_announcement_detail(self, announcement_id: str) -> dict[str, Any] | None:
         """
         Retrieve an announcement from messages.json (including locally backed-up attachments).
         """
@@ -790,12 +889,6 @@ class PushService:
             found = next((m for m in store["messages"] if m.get("uid") == target_uid), None)
             if not found:
                 return None
-
-            if mark_deleted and not found.get("is_deleted"):
-                found["is_deleted"] = True
-                if isinstance(found.get("item"), dict):
-                    found["item"]["is_deleted"] = True
-                self.save_message_store(store)
 
             disp = self._reconstruct_display_item(found)
             attachments = list(found.get("attachments") or [])
@@ -857,7 +950,11 @@ class PushService:
             unpushed = [
                 m
                 for m in reversed(messages)
-                if m.get("type") == "reminder" and m.get("uid") and m["uid"] not in pushed_set
+                if m.get("type") == "reminder"
+                and not m.get("is_deleted")
+                and m.get("uid")
+                and m["uid"] not in pushed_set
+                and _message_is_pushable_for_device(m, latest_sub)
             ]
 
             device_expired = False

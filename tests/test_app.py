@@ -154,6 +154,134 @@ def test_push_subscribe_and_unsubscribe(tmp_path: Path):
     assert len(list((tmp_path / "devices").glob("*.json"))) == 0
 
 
+def test_old_reminder_backfill_is_baselined_and_only_newer_item_is_pushed(
+    tmp_path: Path, monkeypatch
+):
+    svc = PushService(data_dir=tmp_path)
+    subscription = {
+        "endpoint": "https://web.push.apple.com/backfill-device",
+        "keys": {"p256dh": "key", "auth": "auth"},
+    }
+    svc.add_subscription(subscription)
+    device = svc.get_subscriptions()[0]
+    device["subscribed_at"] = "2026-11-10T10:09:30Z"
+    svc.save_device_subscription(device)
+
+    def reminder(item_id: str, minute: int) -> dict[str, str]:
+        return {
+            "id": item_id,
+            "pushing_time": f"2026-11-10T10:{minute:02d}:00.000000Z",
+            "feature_name": "postal",
+            "title": item_id,
+            "body": item_id,
+        }
+
+    svc.sync_messages(reminders=[reminder("r-10", 10)], full_sync=True)
+    events = svc.sync_messages(
+        reminders=[
+            reminder("r-11", 11),
+            reminder("r-10", 10),
+            reminder("r-09", 9),
+            reminder("r-08", 8),
+        ],
+        full_sync=True,
+    )
+
+    assert [event["id"] for event in events] == ["r-11"]
+    device = svc.get_subscriptions()[0]
+    pushed_uids = set(device["pushed_message_uids"])
+    assert "reminder:r-08" in pushed_uids
+    assert "reminder:r-09" in pushed_uids
+    assert "reminder:r-11" not in pushed_uids
+
+    delivered: list[str] = []
+    monkeypatch.setattr(
+        svc,
+        "_send_single_push",
+        lambda _sub, message: delivered.append(message["uid"]) or "sent",
+    )
+    result = svc.push_unpushed_messages()
+    assert result["sent"] == 1
+    assert delivered == ["reminder:r-11"]
+
+
+def test_device_create_time_blocks_older_reminders_even_if_uid_is_missing(
+    tmp_path: Path, monkeypatch
+):
+    svc = PushService(data_dir=tmp_path)
+    old_reminder = {
+        "id": "r-before-device",
+        "pushing_time": "2020-01-01T00:00:00Z",
+        "feature_name": "postal",
+        "title": "舊提醒",
+        "body": "訂閱前的提醒",
+    }
+    svc.sync_messages(reminders=[old_reminder], full_sync=True)
+    svc.add_subscription(
+        {
+            "endpoint": "https://web.push.apple.com/create-time-device",
+            "keys": {"p256dh": "key", "auth": "auth"},
+        }
+    )
+
+    # Simulate an older device JSON that has a create_time field and a missing UID record.
+    device = svc.get_subscriptions()[0]
+    device.pop("subscribed_at")
+    device["create_time"] = "2026-11-10T10:00:00Z"
+    device["pushed_message_uids"] = []
+    svc.save_device_subscription(device)
+
+    new_reminder = {
+        "id": "r-after-device",
+        "pushing_time": "2026-11-10T10:01:00Z",
+        "feature_name": "postal",
+        "title": "新提醒",
+        "body": "訂閱後的提醒",
+    }
+    svc.sync_messages(reminders=[new_reminder, old_reminder], full_sync=True)
+
+    delivered: list[str] = []
+    monkeypatch.setattr(
+        svc,
+        "_send_single_push",
+        lambda _sub, message: delivered.append(message["uid"]) or "sent",
+    )
+    result = svc.push_unpushed_messages()
+
+    assert result["sent"] == 1
+    assert delivered == ["reminder:r-after-device"]
+
+
+def test_message_json_metadata_and_local_pagination(tmp_path: Path):
+    import json
+
+    svc = PushService(data_dir=tmp_path)
+    svc.sync_messages(
+        announcements=[
+            {"id": "2", "title": "普通公告 2"},
+            {"id": "3", "title": "置頂公告", "is_top": True},
+            {"id": "1", "title": "普通公告 1"},
+        ],
+        reminders=[
+            {"id": "r-1", "pushing_time": "2026-11-10T10:01:00Z", "body": "較舊"},
+            {"id": "r-2", "pushing_time": "2026-11-10T10:02:00Z", "body": "較新"},
+        ],
+    )
+    svc.update_store_metadata(community_name="測試社區", com_id="123")
+
+    first_page, total = svc.get_message_page("announcement", offset=0, max_count=2)
+    second_page, _ = svc.get_message_page("announcement", offset=2, max_count=2)
+    reminder_page, reminder_total = svc.get_message_page("reminder", offset=0, max_count=10)
+    saved = json.loads(svc.messages_file.read_text(encoding="utf-8"))
+
+    assert [item["id"] for item in first_page] == ["3", "2"]
+    assert [item["id"] for item in second_page] == ["1"]
+    assert total == 3
+    assert [item["id"] for item in reminder_page] == ["r-2", "r-1"]
+    assert reminder_total == 2
+    assert saved["metadata"]["community_name"] == "測試社區"
+
+
 def test_recalled_message_is_deleted_and_merged_for_display(tmp_path: Path):
     svc = PushService(data_dir=tmp_path)
     svc.sync_messages(
@@ -168,7 +296,11 @@ def test_recalled_message_is_deleted_and_merged_for_display(tmp_path: Path):
     assert len(msgs_initial) == 2
     assert all(m["is_deleted"] is False for m in msgs_initial)
 
-    # Now announcement 101 is recalled on SmartDaily (only 100 is returned by live API)
+    # A full background sync marks announcement 101 as recalled; display merging is read-only.
+    svc.sync_messages(
+        announcements=[{"id": "100", "title": "正常公告", "content": "正常保留"}],
+        full_sync=True,
+    )
     merged = svc.merge_with_deleted_items(
         "announcement",
         [{"id": "100", "title": "正常公告", "content": "正常保留"}],
@@ -256,8 +388,135 @@ def test_poll_once_trace_id_in_logs(tmp_path: Path, monkeypatch, caplog):
     assert len(poll_records) >= 3
     messages = [r.getMessage() for r in poll_records]
     assert any("Poll started" in m for m in messages)
-    assert any("Polled 1 announcements, 1 reminders" in m for m in messages)
+    assert any("Polled 1 announcements and 1 reminders" in m for m in messages)
     assert any("Poll completed:" in m for m in messages)
+
+
+def test_poll_once_fetches_all_announcement_and_reminder_pages(tmp_path: Path, monkeypatch):
+    import asyncio
+    import importlib
+
+    main_mod = importlib.import_module("smartdaily_web.main")
+    svc = PushService(data_dir=tmp_path)
+    monkeypatch.setattr(main_mod, "push_service", svc)
+    monkeypatch.setattr(main_mod, "poll_lock", asyncio.Lock())
+    monkeypatch.setattr(
+        main_mod,
+        "poll_status",
+        {
+            "last_poll_at": None,
+            "last_trace_id": None,
+            "last_error": None,
+            "is_running": False,
+            "poll_interval_seconds": 180,
+        },
+    )
+
+    announcement_offsets: list[int] = []
+
+    async def fake_get_announcements(offset: int = 0, max_count: int = 10):
+        announcement_offsets.append(offset)
+        if offset == 0:
+            return {
+                "community_name": "測試社區",
+                "com_id": "123",
+                "has_more": True,
+                "items": [{"id": "102", "title": "較新公告"}],
+            }
+        return {"has_more": False, "items": [{"id": "101", "title": "較舊公告"}]}
+
+    reminder_cursors: list[str] = []
+
+    async def fake_get_reminders(before_datetime: str = ""):
+        reminder_cursors.append(before_datetime)
+        if not before_datetime:
+            return {
+                "has_more": True,
+                "next_before_datetime": "2026-11-10T10:01:00Z",
+                "items": [
+                    {
+                        "id": "r-2",
+                        "pushing_time": "2026-11-10T10:02:00Z",
+                        "feature_name": "postal",
+                        "title": "較新提醒",
+                        "body": "新包裹",
+                    }
+                ],
+            }
+        return {
+            "has_more": False,
+            "next_before_datetime": "",
+            "items": [
+                {
+                    "id": "r-1",
+                    "pushing_time": "2026-11-10T10:01:00Z",
+                    "feature_name": "postal",
+                    "title": "較舊提醒",
+                    "body": "舊包裹",
+                }
+            ],
+        }
+
+    async def fake_cache_attachments(_announcement_id: str):
+        return None
+
+    monkeypatch.setattr(main_mod.client, "get_announcements", fake_get_announcements)
+    monkeypatch.setattr(main_mod.client, "get_my_reminders", fake_get_reminders)
+    monkeypatch.setattr(
+        main_mod, "ensure_announcement_attachments_cached", fake_cache_attachments
+    )
+
+    result = asyncio.run(main_mod.poll_once())
+
+    assert result["new_events_count"] == 0  # first sync establishes the historical baseline
+    assert announcement_offsets == [0, 10]
+    assert reminder_cursors == ["", "2026-11-10T10:01:00Z"]
+    announcements, ann_total = svc.get_message_page("announcement", 0, 10)
+    reminders, rem_total = svc.get_message_page("reminder", 0, 10)
+    assert ann_total == 2
+    assert {item["id"] for item in announcements} == {"101", "102"}
+    assert rem_total == 2
+    assert {item["id"] for item in reminders} == {"r-1", "r-2"}
+    assert svc.get_store_metadata()["community_name"] == "測試社區"
+
+
+def test_manual_poll_schedules_once_and_skips_when_running(monkeypatch):
+    import asyncio
+    import importlib
+
+    main_mod = importlib.import_module("smartdaily_web.main")
+
+    async def scenario():
+        started = asyncio.Event()
+        finish = asyncio.Event()
+        calls = 0
+
+        async def fake_poll_once():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await finish.wait()
+
+        monkeypatch.setattr(main_mod, "poll_lock", asyncio.Lock())
+        monkeypatch.setattr(main_mod, "manual_poll_task", None)
+        monkeypatch.setattr(main_mod, "poll_once", fake_poll_once)
+
+        first = main_mod.schedule_manual_poll()
+        second = main_mod.schedule_manual_poll()
+        assert first == {"started": True, "status": "scheduled"}
+        assert second == {"started": False, "status": "already_running"}
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert calls == 1
+
+        finish.set()
+        await main_mod.manual_poll_task
+
+        await main_mod.poll_lock.acquire()
+        third = main_mod.schedule_manual_poll()
+        main_mod.poll_lock.release()
+        assert third == {"started": False, "status": "already_running"}
+
+    asyncio.run(scenario())
 
 
 def test_legacy_subscription_migration_and_expired_device_cleanup(tmp_path: Path, monkeypatch):
@@ -375,6 +634,8 @@ def test_reminder_iso_timestamp_pagination_cutoff_and_recall_detection(tmp_path:
     }
     assert len(next_page1) == 10
 
+    # Sync is performed by the background job; the display merge only reads stored state.
+    svc.sync_messages(reminders=next_page1)
     merged = svc.merge_with_deleted_items("reminder", next_page1, is_first_page=True)
     by_id = {m["id"]: m for m in svc.get_messages()}
     # uuid-09 (10:09 >= cutoff 10:02) was recalled -> is_deleted=True
@@ -495,13 +756,21 @@ def test_smartdaily_client_pagination_404_detail_and_reminder_files(monkeypatch)
     ]
 
 
-def test_fastapi_announcement_detail_fallback_and_path_traversal_guard(tmp_path: Path, monkeypatch):
+def test_fastapi_announcement_detail_reads_local_json_and_guards_paths(tmp_path: Path, monkeypatch):
     import asyncio
     import importlib
+
+    import pytest
+    from fastapi import HTTPException
 
     main_mod = importlib.import_module("smartdaily_web.main")
     svc = PushService(data_dir=tmp_path)
     monkeypatch.setattr(main_mod, "push_service", svc)
+
+    async def unexpected_detail_call(_announcement_id: str):
+        raise AssertionError("announcement detail endpoint must read the local archive")
+
+    monkeypatch.setattr(main_mod.client, "get_announcement_detail", unexpected_detail_call)
 
     # Path traversal guard must block '..' and '/'
     assert svc.get_attachment_file_path("../etc", "passwd") is None
@@ -523,33 +792,93 @@ def test_fastapi_announcement_detail_fallback_and_path_traversal_guard(tmp_path:
         },
         downloaded_files={1: ("1_a.pdf", b"%PDF-1.4")},
     )
+    svc.sync_messages(announcements=[], full_sync=True)
 
-    async def fake_detail_404(aid: str):
-        return {
-            "id": aid,
-            "title": "",
-            "type_name": "公告",
-            "create_date": "",
-            "content": "",
-            "attachments": [],
-            "attachment_count": 0,
-            "is_deleted": True,
-            "error_description": "公告已下架",
-        }
-
-    monkeypatch.setattr(main_mod.client, "get_announcement_detail", fake_detail_404)
-
-    # Case A: Announcement 101 was backed up locally before 404 -> returns local backup
+    # Announcement detail and recalled state come from the local JSON archive.
     res_backed_up = asyncio.run(main_mod.get_announcement_detail("101"))
     assert res_backed_up["is_deleted"] is True
     assert res_backed_up["title"] == "本地已備份公告"
     assert res_backed_up["content"] == "備份內文"
     assert res_backed_up["attachments"][0]["url"] == "/api/attachments/101/1_a.pdf"
 
-    # Case B: Announcement 2610272893 was unpublished before service deployed (not in messages.json)
-    res_unbacked = asyncio.run(main_mod.get_announcement_detail("2610272893"))
-    assert res_unbacked["is_deleted"] is True
-    assert res_unbacked["error_description"] == "公告已下架"
+    # Unknown announcements are not fetched on demand from SmartDaily.
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(main_mod.get_announcement_detail("2610272893"))
+    assert exc_info.value.status_code == 404
+
+
+def test_frontend_data_endpoints_and_test_push_use_local_json(tmp_path: Path, monkeypatch):
+    import asyncio
+    import importlib
+
+    main_mod = importlib.import_module("smartdaily_web.main")
+    svc = PushService(data_dir=tmp_path)
+    monkeypatch.setattr(main_mod, "push_service", svc)
+    svc.sync_messages(
+        announcements=[
+            {"id": "101", "title": "本地公告", "content": "公告內容"},
+        ],
+        reminders=[
+            {
+                "id": "r-1",
+                "pushing_time": "2026-11-10T10:00:00Z",
+                "feature_name": "postal",
+                "title": "包裹到件",
+                "body": "有一件包裹",
+            }
+        ],
+    )
+    svc.update_store_metadata(community_name="本地社區", com_id="123")
+
+    async def unexpected_smartdaily_call(*_args, **_kwargs):
+        raise AssertionError("frontend data endpoints must not call SmartDaily")
+
+    monkeypatch.setattr(main_mod.client, "ensure_context", unexpected_smartdaily_call)
+    monkeypatch.setattr(main_mod.client, "get_announcements", unexpected_smartdaily_call)
+    monkeypatch.setattr(main_mod.client, "get_my_reminders", unexpected_smartdaily_call)
+    monkeypatch.setattr(main_mod.client, "get_announcement_detail", unexpected_smartdaily_call)
+
+    status = asyncio.run(main_mod.get_status())
+    ann_page = asyncio.run(main_mod.list_announcements(offset=0, max_count=1))
+    reminder_page = asyncio.run(main_mod.list_reminders(offset=0, max_count=1))
+    detail = asyncio.run(main_mod.get_announcement_detail("101"))
+
+    pushed: dict[str, str] = {}
+
+    def fake_test_push(**kwargs):
+        pushed.update(kwargs)
+        return {"sent": 0, "failed": 0, "active_subscribers": 0}
+
+    monkeypatch.setattr(svc, "send_push_to_all", fake_test_push)
+    test_result = asyncio.run(main_mod.send_test_push())
+
+    assert status["community_name"] == "本地社區"
+    assert ann_page["items"][0]["id"] == "101"
+    assert reminder_page["items"][0]["id"] == "r-1"
+    assert detail["content"] == "公告內容"
+    assert test_result["body"] == "📢 最新公告：本地公告\n📬 最新提醒：有一件包裹..."
+    assert pushed["title"].startswith("[🔔 推播測試] 本地社區")
+
+
+def test_background_detail_fetch_marks_recalled_announcement(tmp_path: Path, monkeypatch):
+    import asyncio
+    import importlib
+
+    main_mod = importlib.import_module("smartdaily_web.main")
+    svc = PushService(data_dir=tmp_path)
+    monkeypatch.setattr(main_mod, "push_service", svc)
+    svc.sync_messages(announcements=[{"id": "101", "title": "已下架公告"}])
+
+    async def fake_detail(_announcement_id: str):
+        return {"id": "101", "title": "", "content": "", "is_deleted": True}
+
+    monkeypatch.setattr(main_mod.client, "get_announcement_detail", fake_detail)
+    result = asyncio.run(main_mod.ensure_announcement_attachments_cached("101"))
+    stored = svc.get_stored_announcement_detail("101")
+
+    assert result is None
+    assert stored is not None
+    assert stored["is_deleted"] is True
 
 
 def test_frontend_ui_conventions_tabs_filters_infinite_scroll_and_emoji_spacing():
@@ -572,6 +901,8 @@ def test_frontend_ui_conventions_tabs_filters_infinite_scroll_and_emoji_spacing(
     assert "IntersectionObserver" in html_text
     assert "maybeAutoLoadMore" in html_text
     assert 'id="loadMoreBtn"' not in html_text
+    assert 'fetch(`/api/announcements?offset=${currentOffset}&max_count=10`)' in html_text
+    assert 'fetch(`/api/notifications/reminders?offset=${currentOffset}&max_count=10`)' in html_text
 
     # 4. Emoji spacing: strictly 1 half-width space in '🗑️ 已回收', never double-space or zero-space
     assert "🗑️ 已回收" in html_text

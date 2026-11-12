@@ -4,10 +4,13 @@
 [![GitHub Release](https://img.shields.io/github/v/release/shuangrain/smartdaily-web?color=blue)](https://github.com/shuangrain/smartdaily-web/releases)
 [![GHCR](https://img.shields.io/badge/GHCR-ghcr.io%2Fshuangrain%2Fsmartdaily--web-blue?logo=docker)](https://github.com/shuangrain/smartdaily-web/pkgs/container/smartdaily-web)
 
-支援 **iOS 16.4+ 主畫面 PWA Web Push 推播通知**與桌面瀏覽器的輕量級 Web 服務，整合：
-1. **📢 社區公告**：自動過濾 `ComId == ""` 的智生活平台團購廣告，並在背景發現新公告時**自動將 PDF / 圖片附件下載備份至本地**（同時支援點開時即時刷新 15 分鐘簽名網址），即使公告事後被社區回收刪除（`🗑️ 已回收`）仍可完整檢視內文與附件。
-2. **📬 我的提醒（支援類型篩選）**：串接 `https://notification.kingnetsmart.com.tw/api/NotificationBox/LoadNotices`，完整涵蓋 `📦 郵務包裹`、`🔑 寄放物`、`📢 社區公告`、`🔔 個人通知`（含物管圖片附件）與 `📬 其他` 提醒，並提供網頁端分類篩選器。
-3. **📲 Web Push 自動推播（依裝置獨立拆檔追蹤）**：統一由涵蓋範圍最完整的「📬 我的提醒」觸發推播，並在推播標題自動加上 `[類型]` 前綴（例如 `[📦 郵務包裹] 包裹到件通知`、`[📢 社區公告] 新公告通知`）；所有訊息完整保存於 `data/messages.json`（含 `is_deleted` 回收標記），每台訂閱裝置與其已推播狀態分別獨立儲存於 `data/devices/<device_id>.json`（搭配 Atomic Write 避免多裝置同時讀寫衝突）。
+提供手機、平板與電腦使用的社區公告與提醒服務，也支援 iPhone 和 iPad 加入主畫面後接收通知。
+
+公告與提醒會定時更新，網頁顯示已保存的內容。按「立即檢查新訊息」會開始更新；如果正在更新，就不會重複開始。
+
+1. **📢 社區公告**：公告內文與 PDF、圖片附件會保存下來。即使公告之後被社區撤下，已保存的內容仍可查看。
+2. **📬 我的提醒**：查看包裹、寄放物、社區公告、個人通知與其他提醒，也可以按類型篩選。
+3. **📲 新訊息通知**：有新提醒時會通知已訂閱的裝置；各裝置分別保存自己的通知設定與接收紀錄。
 
 > [!WARNING]
 > **⚠️ 免責聲明 (Disclaimer)**  
@@ -16,43 +19,38 @@
 
 ---
 
-## 🏗️ 系統架構
+## 🏗️ 資料如何更新與顯示
 
 ```mermaid
 flowchart TD
-    subgraph Cloud["智生活雲端 API"]
-        API_Ann["社區公告與附件 API"]
-        API_Rem["我的提醒 API (LoadNotices)"]
+    subgraph Cloud["智生活"]
+        API_Ann["社區公告與附件"]
+        API_Rem["個人提醒"]
     end
 
-    subgraph App["smartdaily-web (FastAPI)"]
-        Client["SmartdailyClient (自動換發 Token)"]
-        Poller["背景定時輪巡"]
-        PushSvc["PushService (訊息同步 / 回收偵測 / 推播)"]
-        WebUI["PWA 前端與 REST API (公告檢視 / 提醒分類篩選)"]
+    subgraph App["社區通知服務"]
+        Poller["定時更新 / 手動檢查"]
+        WebUI["網站：查看公告、提醒與附件"]
     end
 
-    subgraph Data["本地資料 (/app/data)"]
-        MsgStore["messages.json (完整訊息庫 + is_deleted)"]
-        AttFiles["attachments/ (公告 PDF 與圖片備份)"]
-        DevFiles["devices/ (各裝置獨立訂閱與推播紀錄)"]
+    subgraph Data["本機保存的資料"]
+        MsgStore["公告與提醒紀錄"]
+        AttFiles["公告附件"]
+        DevFiles["各裝置的通知設定"]
     end
 
-    Users["訂閱裝置 (iOS PWA / 桌面瀏覽器)"]
+    Users["手機、平板與電腦"]
 
-    Poller --> Client
-    WebUI --> Client
-    Client --> API_Ann
-    Client --> API_Rem
-
-    Poller --> PushSvc
-    WebUI --> PushSvc
-    PushSvc --> MsgStore
-    PushSvc --> AttFiles
-    PushSvc --> DevFiles
-
-    PushSvc -->|"Web Push 推播 (含類型前綴)"| Users
-    Users -->|"瀏覽 / 篩選 / 訂閱"| WebUI
+    Poller --> API_Ann
+    Poller --> API_Rem
+    Poller --> MsgStore
+    Poller --> AttFiles
+    Poller --> DevFiles
+    WebUI -->|"按鈕啟動更新"| Poller
+    MsgStore --> WebUI
+    AttFiles --> WebUI
+    Poller -->|"新提醒通知"| Users
+    Users -->|"瀏覽與管理通知"| WebUI
 ```
 
 ---

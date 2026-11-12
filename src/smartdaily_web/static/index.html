@@ -508,13 +508,12 @@
           currentOffset += 10;
           renderAnnouncements(items, append);
         } else if (tab === "reminders") {
-          const q = nextBeforeDatetime ? `?before_datetime=${encodeURIComponent(nextBeforeDatetime)}` : "";
-          const res = await fetch(`/api/notifications/reminders${q}`);
+          const res = await fetch(`/api/notifications/reminders?offset=${currentOffset}&max_count=10`);
           const data = await res.json();
           if (gen !== loadGeneration) return;
           const items = data.items || [];
           hasMoreData = Boolean(data.has_more);
-          nextBeforeDatetime = data.next_before_datetime || "";
+          currentOffset += 10;
           loadedReminders = append ? loadedReminders.concat(items) : items;
           renderReminders();
         }
@@ -576,7 +575,7 @@
 
       titleEl.textContent = fallbackAnn ? fallbackAnn.title : "載入中...";
       metaEl.textContent = fallbackAnn ? `發布時間：${fallbackAnn.create_date || fallbackAnn.start_date}` : "";
-      contentEl.textContent = "正在載入最新內容與有效附件連結...";
+      contentEl.textContent = "正在讀取本地公告備份...";
       attachBox.style.display = "none";
       attachBox.innerHTML = "";
       modal.classList.add("open");
@@ -603,7 +602,7 @@
 
         if (detail.attachments && detail.attachments.length > 0) {
           attachBox.style.display = "block";
-          attachBox.innerHTML = `<h4>📎 公告附件（共 ${detail.attachments.length} 個，已即時刷新簽名連結）</h4>`;
+          attachBox.innerHTML = `<h4>📎 本地公告附件備份（共 ${detail.attachments.length} 個）</h4>`;
           detail.attachments.forEach((att) => {
             const div = document.createElement("div");
             div.className = "attachment-item";
@@ -884,9 +883,13 @@
       sentinelObserver.observe(document.getElementById("scrollSentinel"));
     }
     document.getElementById("pollNowBtn").addEventListener("click", async () => {
-      const res = await fetch("/api/poll-now", { method: "POST" });
-      const data = await res.json();
-      showToast(`⚡ 檢查完成，發現 ${data.new_events_count} 則新訊息`);
+      try {
+        const res = await fetch("/api/poll-now", { method: "POST" });
+        const data = await res.json();
+        showToast(data.started ? "⚡ 已啟動背景同步，完成後重新載入資料" : "⏳ 背景同步已在執行中");
+      } catch (err) {
+        showToast("觸發背景同步失敗：" + err.message);
+      }
     });
     document.getElementById("closeModalBtn").addEventListener("click", () => {
       document.getElementById("detailModal").classList.remove("open");

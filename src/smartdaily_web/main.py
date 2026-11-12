@@ -57,16 +57,19 @@ poll_status: dict[str, Any] = {
     "last_poll_at": None,
     "last_trace_id": None,
     "last_error": None,
+    "is_running": False,
     "poll_interval_seconds": POLL_INTERVAL_SECONDS,
 }
 poll_lock = asyncio.Lock()
+manual_poll_task: asyncio.Task[None] | None = None
 
 
 async def ensure_announcement_attachments_cached(announcement_id: str) -> dict[str, Any] | None:
     """Fetch announcement detail and download/backup attachments to local storage."""
     try:
         detail = await client.get_announcement_detail(announcement_id)
-        if not detail.get("title") and not detail.get("content"):
+        if detail.get("is_deleted") or (not detail.get("title") and not detail.get("content")):
+            push_service.mark_announcement_deleted(announcement_id)
             return None
         raw_atts = detail.get("attachments", [])
         downloaded = await client.download_attachment_files(raw_atts)
@@ -90,66 +93,139 @@ async def ensure_announcement_attachments_cached(announcement_id: str) -> dict[s
         return None
 
 
+async def fetch_all_announcements(
+    page_size: int = 10,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Fetch every announcement page, retaining the first page's community metadata."""
+    first_data: dict[str, Any] = {}
+    items_by_id: dict[str, dict[str, Any]] = {}
+    offset = 0
+    while True:
+        data = await client.get_announcements(offset=offset, max_count=page_size)
+        if not first_data:
+            first_data = data
+        for item in data.get("items", []):
+            item_id = str(item.get("id", ""))
+            if item_id:
+                items_by_id[item_id] = item
+        if not data.get("has_more"):
+            break
+        offset += page_size
+    return first_data, list(items_by_id.values())
+
+
+async def fetch_all_reminders() -> list[dict[str, Any]]:
+    """Fetch reminder pages until SmartDaily returns the final page."""
+    items_by_id: dict[str, dict[str, Any]] = {}
+    before_datetime = ""
+    while True:
+        data = await client.get_my_reminders(before_datetime=before_datetime)
+        items = data.get("items", [])
+        for item in items:
+            item_id = str(item.get("id", ""))
+            if item_id:
+                items_by_id[item_id] = item
+        if not data.get("has_more") or not items:
+            break
+        next_before_datetime = str(data.get("next_before_datetime", ""))
+        if not next_before_datetime or next_before_datetime == before_datetime:
+            logger.warning("Reminder pagination stopped because its cursor did not advance")
+            break
+        before_datetime = next_before_datetime
+    return list(items_by_id.values())
+
+
 async def poll_once() -> dict[str, Any]:
-    """Fetch latest announcements (for attachment backup) and reminders (for Web Push)."""
+    """Fetch all SmartDaily pages, sync local JSON, cache attachments, and send pushes."""
+    if poll_lock.locked():
+        logger.info("Poll skipped because another poll is already running")
+        return {"skipped": True, "reason": "already_running"}
+
+    await poll_lock.acquire()
     trace_id = str(uuid.uuid4())
     token = trace_id_var.set(trace_id)
+    poll_status["is_running"] = True
     try:
-        async with poll_lock:
-            poll_status["last_trace_id"] = trace_id
-            logger.info("Poll started")
-            try:
-                ann_data, rem_data = await asyncio.gather(
-                    client.get_announcements(offset=0, max_count=10),
-                    client.get_my_reminders(before_datetime=""),
-                )
-                ann_items = ann_data.get("items", [])
-                rem_items = rem_data.get("items", [])
-                logger.info(
-                    "Polled %d announcements, %d reminders",
-                    len(ann_items),
-                    len(rem_items),
-                )
-                events = push_service.sync_messages(
-                    announcements=ann_items,
-                    reminders=rem_items,
-                )
-                for ev in events:
-                    logger.info("New %s recorded (%s): %s", ev["type"], ev["id"], ev["title"])
+        poll_status["last_trace_id"] = trace_id
+        logger.info("Poll started")
+        try:
+            ann_result, rem_items = await asyncio.gather(
+                fetch_all_announcements(),
+                fetch_all_reminders(),
+            )
+            ann_data, ann_items = ann_result
 
-                # Back up attachments for any announcements not yet cached locally
-                for aid in push_service.get_uncached_announcement_ids():
-                    await ensure_announcement_attachments_cached(aid)
+            logger.info(
+                "Polled %d announcements and %d reminders",
+                len(ann_items),
+                len(rem_items),
+            )
+            events = push_service.sync_messages(
+                announcements=ann_items,
+                reminders=rem_items,
+                full_sync=True,
+            )
+            push_service.update_store_metadata(
+                community_name=ann_data.get("community_name", ""),
+                com_id=ann_data.get("com_id", ""),
+                last_synced_at=datetime.now(timezone.utc).isoformat(),
+            )
+            for ev in events:
+                logger.info("New %s recorded (%s): %s", ev["type"], ev["id"], ev["title"])
 
-                push_res = await asyncio.to_thread(push_service.push_unpushed_messages)
-                pushed_count = push_res.get("sent", 0)
-                failed_count = push_res.get("failed", 0)
-                active_subs = push_res.get("active_subscribers", 0)
+            # Cache full announcement details and attachments in the background so
+            # frontend detail views can stay entirely local.
+            for aid in push_service.get_uncached_announcement_ids():
+                await ensure_announcement_attachments_cached(aid)
 
-                poll_status["last_poll_at"] = datetime.now(timezone.utc).isoformat()
-                poll_status["last_error"] = None
-                logger.info(
-                    "Poll completed: announcements=%d, reminders=%d, new_events=%d, "
-                    "pushed=%d, failed=%d, active_subscribers=%d",
-                    len(ann_items),
-                    len(rem_items),
-                    len(events),
-                    pushed_count,
-                    failed_count,
-                    active_subs,
-                )
-                return {
-                    "trace_id": trace_id,
-                    "new_events_count": len(events),
-                    "pushed_count": pushed_count,
-                    "events": events,
-                }
-            except Exception as exc:
-                logger.warning("Polling check failed: %s", exc)
-                poll_status["last_error"] = str(exc)
-                raise
+            push_res = await asyncio.to_thread(push_service.push_unpushed_messages)
+            pushed_count = push_res.get("sent", 0)
+            failed_count = push_res.get("failed", 0)
+            active_subs = push_res.get("active_subscribers", 0)
+
+            poll_status["last_poll_at"] = datetime.now(timezone.utc).isoformat()
+            poll_status["last_error"] = None
+            logger.info(
+                "Poll completed: announcements=%d, reminders=%d, new_events=%d, pushed=%d, "
+                "failed=%d, active_subscribers=%d",
+                len(ann_items),
+                len(rem_items),
+                len(events),
+                pushed_count,
+                failed_count,
+                active_subs,
+            )
+            return {
+                "trace_id": trace_id,
+                "new_events_count": len(events),
+                "pushed_count": pushed_count,
+                "events": events,
+            }
+        except Exception as exc:
+            logger.warning("Polling check failed: %s", exc)
+            poll_status["last_error"] = str(exc)
+            raise
     finally:
+        poll_status["is_running"] = False
+        poll_lock.release()
         trace_id_var.reset(token)
+
+
+async def _run_manual_poll() -> None:
+    try:
+        await poll_once()
+    except Exception:
+        # poll_once records the error and log entry; keep the detached task handled.
+        pass
+
+
+def schedule_manual_poll() -> dict[str, Any]:
+    """Schedule one poll in the background, skipping it if a poll is active."""
+    global manual_poll_task
+    if poll_lock.locked() or (manual_poll_task and not manual_poll_task.done()):
+        return {"started": False, "status": "already_running"}
+    manual_poll_task = asyncio.create_task(_run_manual_poll())
+    return {"started": True, "status": "scheduled"}
 
 
 async def background_poll_loop() -> None:
@@ -200,79 +276,46 @@ class TestPushPayload(BaseModel):
 
 @app.get("/api/status")
 async def get_status() -> dict[str, Any]:
-    try:
-        _, com_id, community_name = await client.ensure_context()
-        configured = True
-        error = None
-    except Exception as exc:
-        com_id = ""
-        community_name = "尚未綁定社區"
-        configured = False
-        error = str(exc)
+    metadata = push_service.get_store_metadata()
+    com_id = str(metadata.get("com_id", ""))
+    community_name = str(metadata.get("community_name") or "尚未同步社區資料")
 
     return {
-        "configured": configured,
+        "configured": bool(com_id),
         "community_name": community_name,
         "com_id": com_id,
-        "error": error,
+        "error": poll_status["last_error"],
         "subscribers_count": len(push_service.get_subscriptions()),
         "stored_messages_count": len(push_service.get_messages()),
-        "poll": poll_status,
+        "poll": {
+            **poll_status,
+            "last_poll_at": poll_status["last_poll_at"] or metadata.get("last_synced_at"),
+        },
     }
 
 
 @app.get("/api/announcements")
 async def list_announcements(offset: int = 0, max_count: int = 10) -> dict[str, Any]:
-    try:
-        data = await client.get_announcements(offset=offset, max_count=max_count)
-        data["items"] = push_service.merge_with_deleted_items(
-            "announcement",
-            data.get("items", []),
-            is_first_page=(offset == 0),
-        )
-        data["total_count"] = len(data["items"])
-        return data
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    items, total = push_service.get_message_page("announcement", offset, max_count)
+    metadata = push_service.get_store_metadata()
+    return {
+        "community_name": metadata.get("community_name", ""),
+        "com_id": metadata.get("com_id", ""),
+        "offset": max(0, offset),
+        "max_count": max(1, min(max_count, 100)),
+        "has_more": max(0, offset) + len(items) < total,
+        "total_count": total,
+        "latest": items[0] if items else None,
+        "items": items,
+    }
 
 
 @app.get("/api/announcements/{announcement_id}")
 async def get_announcement_detail(announcement_id: str) -> dict[str, Any]:
     stored = push_service.get_stored_announcement_detail(announcement_id)
-    if stored and stored.get("is_deleted"):
-        return stored
-
-    try:
-        detail = await client.get_announcement_detail(announcement_id)
-        if detail.get("is_deleted") or (not detail.get("title") and not detail.get("content")):
-            if stored:
-                return (
-                    push_service.get_stored_announcement_detail(announcement_id, mark_deleted=True)
-                    or stored
-                )
-            detail["is_deleted"] = True
-            return detail
-        if stored and stored.get("attachments_cached"):
-            detail["attachments"] = stored["attachments"]
-            detail["attachment_count"] = len(stored["attachments"])
-        else:
-            downloaded = await client.download_attachment_files(detail.get("attachments", []))
-            saved_atts = push_service.save_announcement_detail_and_attachments(
-                announcement_id=announcement_id,
-                detail=detail,
-                downloaded_files=downloaded,
-            )
-            detail["attachments"] = saved_atts
-            detail["attachment_count"] = len(saved_atts)
-        detail["is_deleted"] = bool(stored.get("is_deleted")) if stored else False
-        return detail
-    except Exception as exc:
-        if stored:
-            return (
-                push_service.get_stored_announcement_detail(announcement_id, mark_deleted=True)
-                or stored
-            )
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if not stored:
+        raise HTTPException(status_code=404, detail="本地 JSON 尚未收錄此公告")
+    return stored
 
 
 @app.get("/api/attachments/{announcement_id}/{filename}")
@@ -284,18 +327,18 @@ async def serve_cached_attachment(announcement_id: str, filename: str) -> FileRe
 
 
 @app.get("/api/notifications/reminders")
-async def list_reminders(before_datetime: str = "") -> dict[str, Any]:
-    try:
-        data = await client.get_my_reminders(before_datetime=before_datetime)
-        data["items"] = push_service.merge_with_deleted_items(
-            "reminder",
-            data.get("items", []),
-            is_first_page=(before_datetime == ""),
-        )
-        data["total_count"] = len(data["items"])
-        return data
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+async def list_reminders(offset: int = 0, max_count: int = 10) -> dict[str, Any]:
+    items, total = push_service.get_message_page("reminder", offset, max_count)
+    has_more = max(0, offset) + len(items) < total
+    return {
+        "offset": max(0, offset),
+        "max_count": max(1, min(max_count, 100)),
+        "has_more": has_more,
+        "total_count": total,
+        "latest": items[0] if items else None,
+        "next_before_datetime": items[-1].get("pushing_time", "") if has_more and items else "",
+        "items": items,
+    }
 
 
 @app.get("/api/push/vapid-public-key")
@@ -325,26 +368,21 @@ async def send_test_push(payload: TestPushPayload | None = None) -> dict[str, An
         body = payload.body if payload and payload.body else None
 
         if not title or not body:
-            try:
-                ann, rem = await asyncio.gather(
-                    client.get_announcements(offset=0, max_count=5),
-                    client.get_my_reminders(before_datetime=""),
-                )
-                latest_ann = ann.get("latest")
-                latest_rem = rem.get("latest")
-                title = title or f"[🔔 推播測試] {ann.get('community_name', '社區')} 通知連線正常"
-                parts = []
-                if latest_ann:
-                    parts.append(f"📢 最新公告：{latest_ann['title']}")
-                if latest_rem:
-                    parts.append(f"📬 最新提醒：{latest_rem['body'][:60]}...")
-                default_body = (
-                    "\n".join(parts) if parts else "您的 iOS / 瀏覽器 Web Push 已正常運作！"
-                )
-                body = body or default_body
-            except Exception:
-                title = title or "[🔔 推播測試] 智生活社區通知測試"
-                body = body or "您的 Web Push 推播通知已正常運作！"
+            metadata = push_service.get_store_metadata()
+            latest_ann_items, _ = push_service.get_message_page("announcement", 0, 1)
+            latest_rem_items, _ = push_service.get_message_page("reminder", 0, 1)
+            latest_ann = latest_ann_items[0] if latest_ann_items else None
+            latest_rem = latest_rem_items[0] if latest_rem_items else None
+            community_name = metadata.get("community_name") or "社區"
+            title = title or f"[🔔 推播測試] {community_name} 通知連線正常"
+            parts = []
+            if latest_ann:
+                parts.append(f"📢 最新公告：{latest_ann.get('title', '')}")
+            if latest_rem:
+                parts.append(f"📬 最新提醒：{str(latest_rem.get('body', ''))[:60]}...")
+            body = body or (
+                "\n".join(parts) if parts else "您的 iOS / 瀏覽器 Web Push 已正常運作！"
+            )
 
         result = await asyncio.to_thread(
             push_service.send_push_to_all,
@@ -360,10 +398,7 @@ async def send_test_push(payload: TestPushPayload | None = None) -> dict[str, An
 
 @app.post("/api/poll-now")
 async def trigger_poll_now() -> dict[str, Any]:
-    try:
-        return await poll_once()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return schedule_manual_poll()
 
 
 @app.get("/manifest.json")
