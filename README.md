@@ -36,8 +36,8 @@ flowchart TD
     subgraph Storage["本地持久化儲存 (/app/data)"]
         Vapid["vapid_keys.json (VAPID 公私鑰)"]
         MsgStore["messages.json (完整訊息庫 + is_deleted 狀態)"]
-        AttFiles["attachments/<ann_id>/ (公告 PDF / 圖片本地備份)"]
-        DevFiles["devices/<device_id>.json (各裝置獨立已推播紀錄)"]
+        AttFiles["attachments/ann_id/ (公告 PDF 與圖片本地備份)"]
+        DevFiles["devices/device_id.json (各裝置獨立已推播紀錄)"]
     end
 
     subgraph UserDevices["訂閱裝置 (iOS 16.4+ PWA / 桌面瀏覽器)"]
@@ -52,16 +52,16 @@ flowchart TD
     Client --> API_Rem
 
     Poller -->|"同步訊息、備份公告附件、標記已回收"| PushSvc
-    WebUI -->|"合併顯示已回收訊息 (is_deleted)"| PushSvc
-    PushSvc <-->|"Atomic 讀寫"| MsgStore
-    PushSvc <-->|"自動下載與讀取"| AttFiles
-    PushSvc <-->|"依裝置獨立讀寫"| DevFiles
+    WebUI -->|"合併顯示已回收訊息"| PushSvc
+    PushSvc -->|"Atomic 讀寫"| MsgStore
+    PushSvc -->|"自動下載與讀取"| AttFiles
+    PushSvc -->|"依裝置獨立讀寫"| DevFiles
     PushSvc -->|"讀取金鑰"| Vapid
 
-    PushSvc -->|"Web Push ([類型] 標題前綴，依裝置獨立追蹤)"| DeviceA
-    PushSvc -->|"Web Push ([類型] 標題前綴，依裝置獨立追蹤)"| DeviceB
-    DeviceA <-->|"瀏覽 / 分類篩選 / 訂閱推播"| WebUI
-    DeviceB <-->|"瀏覽 / 分類篩選 / 訂閱推播"| WebUI
+    PushSvc -->|"Web Push 推播（含類型前綴，依裝置獨立追蹤）"| DeviceA
+    PushSvc -->|"Web Push 推播（含類型前綴，依裝置獨立追蹤）"| DeviceB
+    DeviceA -->|"瀏覽 / 分類篩選 / 訂閱推播"| WebUI
+    DeviceB -->|"瀏覽 / 分類篩選 / 訂閱推播"| WebUI
 ```
 
 ---
