@@ -462,9 +462,7 @@ def test_poll_once_fetches_all_announcement_and_reminder_pages(tmp_path: Path, m
 
     monkeypatch.setattr(main_mod.client, "get_announcements", fake_get_announcements)
     monkeypatch.setattr(main_mod.client, "get_my_reminders", fake_get_reminders)
-    monkeypatch.setattr(
-        main_mod, "ensure_announcement_attachments_cached", fake_cache_attachments
-    )
+    monkeypatch.setattr(main_mod, "ensure_announcement_attachments_cached", fake_cache_attachments)
 
     result = asyncio.run(main_mod.poll_once())
 
@@ -901,8 +899,8 @@ def test_frontend_ui_conventions_tabs_filters_infinite_scroll_and_emoji_spacing(
     assert "IntersectionObserver" in html_text
     assert "maybeAutoLoadMore" in html_text
     assert 'id="loadMoreBtn"' not in html_text
-    assert 'fetch(`/api/announcements?offset=${currentOffset}&max_count=10`)' in html_text
-    assert 'fetch(`/api/notifications/reminders?offset=${currentOffset}&max_count=10`)' in html_text
+    assert "fetch(`/api/announcements?offset=${currentOffset}&max_count=10`)" in html_text
+    assert "fetch(`/api/notifications/reminders?offset=${currentOffset}&max_count=10`)" in html_text
 
     # 4. Emoji spacing: strictly 1 half-width space in '🗑️ 已回收', never double-space or zero-space
     assert "🗑️ 已回收" in html_text
