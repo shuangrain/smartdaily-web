@@ -8,7 +8,7 @@
 1. **📢 社區公告**：自動過濾 `ComId == ""` 的智生活平台團購廣告，並在點開公告時**即時刷新 15 分鐘效期的 PDF / 圖片附件簽名網址**。
 2. **🔔 個人通知**：串接 `/api/v3.51/Message/Notification/List`，顯示物管中心發送給住戶的即時推播（含圖片附件）。
 3. **📬 我的提醒**：串接 `https://notification.kingnetsmart.com.tw/api/NotificationBox/LoadNotices`，完整呈現郵務包裹、寄放物、個人通知與新公告提醒。
-4. **📲 Web Push 自動推播**：背景定期輪詢最新社區公告與個人通知，有新訊息時自動透過 VAPID Web Push 推播至已訂閱的 iPhone / 電腦，並支援隨時一鍵取消訂閱。
+4. **📲 Web Push 自動推播（依裝置獨立追蹤）**：背景定期輪詢最新社區公告、個人通知與我的提醒，將所有訊息統一記錄於 `data/messages.json`，並在 `data/subscriptions.json` 中依各訂閱裝置分別記錄已推播狀態，支援多裝置獨立推播、失敗重試與一鍵取消訂閱。
 
 > [!WARNING]
 > **⚠️ 免責聲明 (Disclaimer)**  

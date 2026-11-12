@@ -61,21 +61,16 @@ async def poll_once() -> dict[str, Any]:
             len(personal_items),
             len(rem_items),
         )
-        events = push_service.check_and_record_new_items(
+        events = push_service.sync_messages(
             announcements=ann_items,
             personal_notifications=personal_items,
             reminders=rem_items,
         )
-        pushed_count = 0
         for ev in events:
-            logger.info("New %s detected (%s): %s", ev["type"], ev["id"], ev["title"])
-            res = push_service.send_push_to_all(
-                title=ev["title"],
-                body=ev["body"],
-                url=ev["url"],
-                tag=ev["tag"],
-            )
-            pushed_count += res.get("sent", 0)
+            logger.info("New %s recorded (%s): %s", ev["type"], ev["id"], ev["title"])
+
+        push_res = push_service.push_unpushed_messages()
+        pushed_count = push_res.get("sent", 0)
 
         poll_status["last_poll_at"] = datetime.now(timezone.utc).isoformat()
         poll_status["last_error"] = None
@@ -153,6 +148,7 @@ async def get_status() -> dict[str, Any]:
         "com_id": com_id,
         "error": error,
         "subscribers_count": len(push_service.get_subscriptions()),
+        "stored_messages_count": len(push_service.get_messages()),
         "poll": poll_status,
     }
 
