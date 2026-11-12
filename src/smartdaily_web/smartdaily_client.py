@@ -91,7 +91,7 @@ class SmartdailyClient:
             self._raw_token = str(token)
             # Token validity is 10 minutes; refresh proactively after 9 minutes
             self._token_expires_mono = time.monotonic() + 540.0
-            logger.debug("Refreshed CommunityUserAccessToken (ExpiredAt=%s)", data.get("ExpiredAt"))
+            logger.info("Refreshed CommunityUserAccessToken (ExpiredAt=%s)", data.get("ExpiredAt"))
             return self._raw_token
 
     async def ensure_context(self) -> tuple[str, str, str]:

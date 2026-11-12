@@ -213,3 +213,48 @@ def test_recalled_message_is_deleted_and_merged_for_display(tmp_path: Path):
     assert detail_with_att is not None
     assert detail_with_att["attachment_count"] == 1
     assert detail_with_att["attachments"][0]["url"] == "/api/attachments/101/1_notice.pdf"
+
+
+def test_poll_once_trace_id_in_logs(tmp_path: Path, monkeypatch, caplog):
+    import asyncio
+    import importlib
+    import logging
+
+    main_mod = importlib.import_module("smartdaily_web.main")
+
+    svc = PushService(data_dir=tmp_path)
+    monkeypatch.setattr(main_mod, "push_service", svc)
+
+    async def fake_get_announcements(offset: int = 0, max_count: int = 10):
+        return {"items": [{"id": "201", "title": "測試公告", "content": "內容"}]}
+
+    async def fake_get_reminders(before_datetime: str = ""):
+        return {
+            "items": [
+                {
+                    "id": "r-1",
+                    "feature_name": "postal",
+                    "title": "包裹到件通知",
+                    "body": "包裹",
+                }
+            ]
+        }
+
+    async def fake_cache_atts(aid: str):
+        return None
+
+    monkeypatch.setattr(main_mod.client, "get_announcements", fake_get_announcements)
+    monkeypatch.setattr(main_mod.client, "get_my_reminders", fake_get_reminders)
+    monkeypatch.setattr(main_mod, "ensure_announcement_attachments_cached", fake_cache_atts)
+
+    with caplog.at_level(logging.INFO):
+        res = asyncio.run(main_mod.poll_once())
+
+    trace_id = res["trace_id"]
+    assert len(trace_id) == 36
+    poll_records = [r for r in caplog.records if getattr(r, "trace_id", None) == trace_id]
+    assert len(poll_records) >= 3
+    messages = [r.getMessage() for r in poll_records]
+    assert any("Poll started" in m for m in messages)
+    assert any("Polled 1 announcements, 1 reminders" in m for m in messages)
+    assert any("Poll completed:" in m for m in messages)

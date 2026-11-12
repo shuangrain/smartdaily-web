@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,11 +23,25 @@ from .smartdaily_client import SmartdailyClient
 
 LOG_LEVEL_STR = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_STR, logging.INFO)
+LOG_FORMAT = "%(asctime)s [%(levelname)s] [trace_id=%(trace_id)s] %(name)s: %(message)s"
 
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+trace_id_var: ContextVar[str] = ContextVar("trace_id", default="-")
+
+_orig_record_factory = logging.getLogRecordFactory()
+
+
+def _trace_record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+    record = _orig_record_factory(*args, **kwargs)
+    if not hasattr(record, "trace_id"):
+        record.trace_id = trace_id_var.get("-")
+    return record
+
+
+logging.setLogRecordFactory(_trace_record_factory)
+logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
+for _handler in logging.getLogger().handlers:
+    _handler.setFormatter(logging.Formatter(LOG_FORMAT))
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("smartdaily_web")
@@ -39,6 +55,7 @@ push_service = PushService()
 
 poll_status: dict[str, Any] = {
     "last_poll_at": None,
+    "last_trace_id": None,
     "last_error": None,
     "poll_interval_seconds": POLL_INTERVAL_SECONDS,
 }
@@ -51,7 +68,8 @@ async def ensure_announcement_attachments_cached(announcement_id: str) -> dict[s
         detail = await client.get_announcement_detail(announcement_id)
         if not detail.get("title") and not detail.get("content"):
             return None
-        downloaded = await client.download_attachment_files(detail.get("attachments", []))
+        raw_atts = detail.get("attachments", [])
+        downloaded = await client.download_attachment_files(raw_atts)
         saved_atts = push_service.save_announcement_detail_and_attachments(
             announcement_id=announcement_id,
             detail=detail,
@@ -59,56 +77,84 @@ async def ensure_announcement_attachments_cached(announcement_id: str) -> dict[s
         )
         detail["attachments"] = saved_atts
         detail["attachment_count"] = len(saved_atts)
+        logger.info(
+            "Cached %d/%d attachment(s) for announcement %s (%s)",
+            len(downloaded),
+            len(raw_atts),
+            announcement_id,
+            detail.get("title", ""),
+        )
         return detail
     except Exception as exc:
-        logger.debug("Could not cache attachments for announcement %s: %s", announcement_id, exc)
+        logger.warning("Could not cache attachments for announcement %s: %s", announcement_id, exc)
         return None
 
 
 async def poll_once() -> dict[str, Any]:
     """Fetch latest announcements (for attachment backup) and reminders (for Web Push)."""
-    async with poll_lock:
-        try:
-            ann_data, rem_data = await asyncio.gather(
-                client.get_announcements(offset=0, max_count=10),
-                client.get_my_reminders(before_datetime=""),
-            )
-            ann_items = ann_data.get("items", [])
-            rem_items = rem_data.get("items", [])
-            logger.debug(
-                "Polled %d announcements, %d reminders",
-                len(ann_items),
-                len(rem_items),
-            )
-            events = push_service.sync_messages(
-                announcements=ann_items,
-                reminders=rem_items,
-            )
-            for ev in events:
-                logger.info("New %s recorded (%s): %s", ev["type"], ev["id"], ev["title"])
+    trace_id = str(uuid.uuid4())
+    token = trace_id_var.set(trace_id)
+    try:
+        async with poll_lock:
+            poll_status["last_trace_id"] = trace_id
+            logger.info("Poll started")
+            try:
+                ann_data, rem_data = await asyncio.gather(
+                    client.get_announcements(offset=0, max_count=10),
+                    client.get_my_reminders(before_datetime=""),
+                )
+                ann_items = ann_data.get("items", [])
+                rem_items = rem_data.get("items", [])
+                logger.info(
+                    "Polled %d announcements, %d reminders",
+                    len(ann_items),
+                    len(rem_items),
+                )
+                events = push_service.sync_messages(
+                    announcements=ann_items,
+                    reminders=rem_items,
+                )
+                for ev in events:
+                    logger.info("New %s recorded (%s): %s", ev["type"], ev["id"], ev["title"])
 
-            # Back up attachments for any announcements not yet cached locally
-            for aid in push_service.get_uncached_announcement_ids():
-                await ensure_announcement_attachments_cached(aid)
+                # Back up attachments for any announcements not yet cached locally
+                for aid in push_service.get_uncached_announcement_ids():
+                    await ensure_announcement_attachments_cached(aid)
 
-            push_res = await asyncio.to_thread(push_service.push_unpushed_messages)
-            pushed_count = push_res.get("sent", 0)
+                push_res = await asyncio.to_thread(push_service.push_unpushed_messages)
+                pushed_count = push_res.get("sent", 0)
+                failed_count = push_res.get("failed", 0)
+                active_subs = push_res.get("active_subscribers", 0)
 
-            poll_status["last_poll_at"] = datetime.now(timezone.utc).isoformat()
-            poll_status["last_error"] = None
-            return {
-                "new_events_count": len(events),
-                "pushed_count": pushed_count,
-                "events": events,
-            }
-        except Exception as exc:
-            logger.warning("Polling check failed: %s", exc)
-            poll_status["last_error"] = str(exc)
-            raise
+                poll_status["last_poll_at"] = datetime.now(timezone.utc).isoformat()
+                poll_status["last_error"] = None
+                logger.info(
+                    "Poll completed: announcements=%d, reminders=%d, new_events=%d, "
+                    "pushed=%d, failed=%d, active_subscribers=%d",
+                    len(ann_items),
+                    len(rem_items),
+                    len(events),
+                    pushed_count,
+                    failed_count,
+                    active_subs,
+                )
+                return {
+                    "trace_id": trace_id,
+                    "new_events_count": len(events),
+                    "pushed_count": pushed_count,
+                    "events": events,
+                }
+            except Exception as exc:
+                logger.warning("Polling check failed: %s", exc)
+                poll_status["last_error"] = str(exc)
+                raise
+    finally:
+        trace_id_var.reset(token)
 
 
 async def background_poll_loop() -> None:
     """Background task to periodically poll SmartDaily API."""
+    logger.info("Background poll loop started (interval=%ds)", POLL_INTERVAL_SECONDS)
     # Initial delay briefly after startup
     await asyncio.sleep(2)
     while True:
@@ -269,37 +315,44 @@ async def unsubscribe_push(payload: UnsubscribePayload) -> dict[str, Any]:
 
 @app.post("/api/push/test")
 async def send_test_push(payload: TestPushPayload | None = None) -> dict[str, Any]:
-    title = payload.title if payload and payload.title else None
-    body = payload.body if payload and payload.body else None
+    trace_id = str(uuid.uuid4())
+    token = trace_id_var.set(trace_id)
+    try:
+        title = payload.title if payload and payload.title else None
+        body = payload.body if payload and payload.body else None
 
-    if not title or not body:
-        try:
-            ann, rem = await asyncio.gather(
-                client.get_announcements(offset=0, max_count=5),
-                client.get_my_reminders(before_datetime=""),
-            )
-            latest_ann = ann.get("latest")
-            latest_rem = rem.get("latest")
-            title = title or f"[🔔 推播測試] {ann.get('community_name', '社區')} 通知連線正常"
-            parts = []
-            if latest_ann:
-                parts.append(f"📢 最新公告：{latest_ann['title']}")
-            if latest_rem:
-                parts.append(f"📬 最新提醒：{latest_rem['body'][:60]}...")
-            default_body = "\n".join(parts) if parts else "您的 iOS / 瀏覽器 Web Push 已正常運作！"
-            body = body or default_body
-        except Exception:
-            title = title or "[🔔 推播測試] 智生活社區通知測試"
-            body = body or "您的 Web Push 推播通知已正常運作！"
+        if not title or not body:
+            try:
+                ann, rem = await asyncio.gather(
+                    client.get_announcements(offset=0, max_count=5),
+                    client.get_my_reminders(before_datetime=""),
+                )
+                latest_ann = ann.get("latest")
+                latest_rem = rem.get("latest")
+                title = title or f"[🔔 推播測試] {ann.get('community_name', '社區')} 通知連線正常"
+                parts = []
+                if latest_ann:
+                    parts.append(f"📢 最新公告：{latest_ann['title']}")
+                if latest_rem:
+                    parts.append(f"📬 最新提醒：{latest_rem['body'][:60]}...")
+                default_body = (
+                    "\n".join(parts) if parts else "您的 iOS / 瀏覽器 Web Push 已正常運作！"
+                )
+                body = body or default_body
+            except Exception:
+                title = title or "[🔔 推播測試] 智生活社區通知測試"
+                body = body or "您的 Web Push 推播通知已正常運作！"
 
-    result = await asyncio.to_thread(
-        push_service.send_push_to_all,
-        title=title,
-        body=body,
-        url="/",
-        tag="smartdaily-test",
-    )
-    return {"ok": True, **result, "title": title, "body": body}
+        result = await asyncio.to_thread(
+            push_service.send_push_to_all,
+            title=title,
+            body=body,
+            url="/",
+            tag="smartdaily-test",
+        )
+        return {"ok": True, "trace_id": trace_id, **result, "title": title, "body": body}
+    finally:
+        trace_id_var.reset(token)
 
 
 @app.post("/api/poll-now")

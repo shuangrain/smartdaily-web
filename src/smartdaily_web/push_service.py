@@ -261,13 +261,25 @@ class PushService:
                     "pushed_message_uids": pushed_uids,
                 }
             )
-            return len(self.get_subscriptions())
+            total = len(self.get_subscriptions())
+            logger.info(
+                "Device subscription saved: device_id=%s (active_subscribers=%d)",
+                device_id,
+                total,
+            )
+            return total
 
     def remove_subscription(self, endpoint: str) -> int:
         """Remove a single device's subscription file without touching other devices."""
         device_id = _make_device_id(endpoint)
         self.delete_device_subscription(device_id)
-        return len(self.get_subscriptions())
+        total = len(self.get_subscriptions())
+        logger.info(
+            "Device subscription removed: device_id=%s (active_subscribers=%d)",
+            device_id,
+            total,
+        )
+        return total
 
     # -------------------------------------------------------------------------
     # Message Sync & Per-Device Web Push Delivery
@@ -337,10 +349,13 @@ class PushService:
         failed = 0
         active_count = 0
         for sub in subs:
+            device_id = sub.get("device_id", "?")
+            logger.info("Sending broadcast push (%s) to device %s: %s", tag, device_id, title)
             status = self._send_single_push(sub, payload_dict)
             if status == "sent":
                 sent += 1
                 active_count += 1
+                logger.info("Broadcast push delivered to device %s", device_id)
             elif status == "expired":
                 failed += 1
                 self.delete_device_subscription(sub["device_id"])
@@ -348,6 +363,12 @@ class PushService:
                 failed += 1
                 active_count += 1
 
+        logger.info(
+            "Broadcast push completed: sent=%d, failed=%d, active_subscribers=%d",
+            sent,
+            failed,
+            active_count,
+        )
         return {"sent": sent, "failed": failed, "active_subscribers": active_count}
 
     @staticmethod
@@ -512,6 +533,7 @@ class PushService:
                 item_copy["is_deleted"] = False
                 msg["item"] = item_copy
             else:
+                was_deleted = bool(msg.get("is_deleted", False))
                 msg.setdefault("is_deleted", False)
                 if not has_more_pages:
                     msg["is_deleted"] = True
@@ -527,6 +549,13 @@ class PushService:
                         msg["is_deleted"] = True
                     elif cutoff_ts is not None and stored_ts is not None and stored_ts >= cutoff_ts:
                         msg["is_deleted"] = True
+                if not was_deleted and msg.get("is_deleted"):
+                    logger.info(
+                        "Message marked as recalled (is_deleted=True): %s (%s) %s",
+                        msg_type,
+                        mid,
+                        msg.get("title", ""),
+                    )
                 if isinstance(msg.get("item"), dict):
                     msg["item"]["is_deleted"] = bool(msg["is_deleted"])
 
@@ -847,6 +876,12 @@ class PushService:
                     sent += 1
                     newly_pushed_for_device.append(msg["uid"])
                     pushed_set.add(msg["uid"])
+                    logger.info(
+                        "Push delivered to device %s for %s (%s)",
+                        device_id,
+                        msg["type"],
+                        msg["id"],
+                    )
                 elif status == "expired":
                     failed += 1
                     device_expired = True
@@ -854,6 +889,12 @@ class PushService:
                     break
                 else:
                     failed += 1
+                    logger.warning(
+                        "Push delivery failed for device %s on %s (%s); will retry on next poll",
+                        device_id,
+                        msg["type"],
+                        msg["id"],
+                    )
 
             if not device_expired:
                 active_count += 1
