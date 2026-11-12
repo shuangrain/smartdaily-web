@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,7 @@ class PushService:
         self.legacy_subs_file = self.data_dir / "subscriptions.json"
         self.legacy_seen_file = self.data_dir / "seen_state.json"
         self.vapid_subject = os.getenv("VAPID_SUBJECT", "mailto:admin@example.com")
+        self._store_lock = threading.RLock()
         self.public_key, self.private_key = self._load_or_create_vapid_keys()
         self._migrate_legacy_subscriptions()
 
@@ -195,28 +197,31 @@ class PushService:
         if not endpoint:
             raise ValueError("Invalid push subscription: missing endpoint")
 
-        device_id = _make_device_id(endpoint)
-        existing = self.get_device_subscription(device_id)
-        known_uids = [m["uid"] for m in self.get_messages() if m.get("uid")]
+        with self._store_lock:
+            device_id = _make_device_id(endpoint)
+            existing = self.get_device_subscription(device_id)
+            known_uids = [m["uid"] for m in self.get_messages() if m.get("uid")]
 
-        if existing and "pushed_message_uids" in existing:
-            pushed_uids = list(existing["pushed_message_uids"])
-            subscribed_at = existing.get("subscribed_at") or datetime.now(timezone.utc).isoformat()
-        else:
-            pushed_uids = list(known_uids)
-            subscribed_at = datetime.now(timezone.utc).isoformat()
+            if existing and "pushed_message_uids" in existing:
+                pushed_uids = list(existing["pushed_message_uids"])
+                subscribed_at = (
+                    existing.get("subscribed_at") or datetime.now(timezone.utc).isoformat()
+                )
+            else:
+                pushed_uids = list(known_uids)
+                subscribed_at = datetime.now(timezone.utc).isoformat()
 
-        self.save_device_subscription(
-            {
-                "device_id": device_id,
-                "endpoint": endpoint,
-                "keys": subscription.get("keys", {}),
-                "user_agent": user_agent,
-                "subscribed_at": subscribed_at,
-                "pushed_message_uids": pushed_uids,
-            }
-        )
-        return len(self.get_subscriptions())
+            self.save_device_subscription(
+                {
+                    "device_id": device_id,
+                    "endpoint": endpoint,
+                    "keys": subscription.get("keys", {}),
+                    "user_agent": user_agent,
+                    "subscribed_at": subscribed_at,
+                    "pushed_message_uids": pushed_uids,
+                }
+            )
+            return len(self.get_subscriptions())
 
     def remove_subscription(self, endpoint: str) -> int:
         """Remove a single device's subscription file without touching other devices."""
@@ -469,80 +474,81 @@ class PushService:
         device file so old historical messages do not trigger push floods.
         Returns the list of newly discovered non-baseline messages.
         """
-        now_iso = datetime.now(timezone.utc).isoformat()
-        store = self.get_message_store()
-        initialized_types = set(store["initialized_types"])
-        existing_messages = store["messages"]
-        existing_uids = {m["uid"] for m in existing_messages if m.get("uid")}
+        with self._store_lock:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            store = self.get_message_store()
+            initialized_types = set(store["initialized_types"])
+            existing_messages = store["messages"]
+            existing_uids = {m["uid"] for m in existing_messages if m.get("uid")}
 
-        inputs_by_type: dict[str, list[dict[str, Any]] | None] = {
-            "announcement": announcements,
-            "personal": personal_notifications,
-            "reminder": reminders,
-        }
-
-        newly_added_chronological: list[dict[str, Any]] = []
-        new_non_baseline_events: list[dict[str, Any]] = []
-        baseline_uids: list[str] = []
-
-        for msg_type, raw_list in inputs_by_type.items():
-            if raw_list is None:
-                continue
-            self._update_deleted_flags_for_type(existing_messages, msg_type, raw_list)
-            is_type_initialized = msg_type in initialized_types
-
-            for raw_item in reversed(raw_list):
-                candidate = self._build_candidate_record(msg_type, raw_item, now_iso)
-                if not candidate:
-                    continue
-                uid = candidate["uid"]
-                if uid not in existing_uids:
-                    existing_uids.add(uid)
-                    newly_added_chronological.append(candidate)
-                    if is_type_initialized:
-                        new_non_baseline_events.append(candidate)
-                    else:
-                        baseline_uids.append(uid)
-                elif not is_type_initialized:
-                    baseline_uids.append(uid)
-
-            initialized_types.add(msg_type)
-
-        # Ensure all existing messages have is_deleted boolean
-        for m in existing_messages:
-            m.setdefault("is_deleted", False)
-
-        updated_messages = list(reversed(newly_added_chronological)) + existing_messages
-        self.save_message_store(
-            {
-                "initialized_types": list(initialized_types),
-                "messages": updated_messages,
+            inputs_by_type: dict[str, list[dict[str, Any]] | None] = {
+                "announcement": announcements,
+                "personal": personal_notifications,
+                "reminder": reminders,
             }
-        )
 
-        # Ensure each existing device file has baseline UIDs recorded independently
-        all_current_uids = [m["uid"] for m in updated_messages]
-        for sub in self.get_subscriptions():
-            device_id = sub["device_id"]
-            latest_sub = self.get_device_subscription(device_id)
-            if not latest_sub:
-                continue
-            if "pushed_message_uids" not in latest_sub:
-                latest_sub["pushed_message_uids"] = list(all_current_uids)
-                self.save_device_subscription(latest_sub)
-            elif baseline_uids:
-                merged = list(dict.fromkeys(baseline_uids + latest_sub["pushed_message_uids"]))
-                latest_sub["pushed_message_uids"] = merged
-                self.save_device_subscription(latest_sub)
+            newly_added_chronological: list[dict[str, Any]] = []
+            new_non_baseline_events: list[dict[str, Any]] = []
+            baseline_uids: list[str] = []
 
-        # Clean up obsolete seen_state.json if present
-        if self.legacy_seen_file.is_file():
-            try:
-                self.legacy_seen_file.unlink()
-            except Exception:
-                pass
+            for msg_type, raw_list in inputs_by_type.items():
+                if raw_list is None:
+                    continue
+                self._update_deleted_flags_for_type(existing_messages, msg_type, raw_list)
+                is_type_initialized = msg_type in initialized_types
 
-        return new_non_baseline_events
+                for raw_item in reversed(raw_list):
+                    candidate = self._build_candidate_record(msg_type, raw_item, now_iso)
+                    if not candidate:
+                        continue
+                    uid = candidate["uid"]
+                    if uid not in existing_uids:
+                        existing_uids.add(uid)
+                        newly_added_chronological.append(candidate)
+                        if is_type_initialized:
+                            new_non_baseline_events.append(candidate)
+                        else:
+                            baseline_uids.append(uid)
+                    elif not is_type_initialized:
+                        baseline_uids.append(uid)
+
+                initialized_types.add(msg_type)
+
+            # Ensure all existing messages have is_deleted boolean
+            for m in existing_messages:
+                m.setdefault("is_deleted", False)
+
+            updated_messages = list(reversed(newly_added_chronological)) + existing_messages
+            self.save_message_store(
+                {
+                    "initialized_types": list(initialized_types),
+                    "messages": updated_messages,
+                }
+            )
+
+            # Ensure each existing device file has baseline UIDs recorded independently
+            all_current_uids = [m["uid"] for m in updated_messages]
+            for sub in self.get_subscriptions():
+                device_id = sub["device_id"]
+                latest_sub = self.get_device_subscription(device_id)
+                if not latest_sub:
+                    continue
+                if "pushed_message_uids" not in latest_sub:
+                    latest_sub["pushed_message_uids"] = list(all_current_uids)
+                    self.save_device_subscription(latest_sub)
+                elif baseline_uids:
+                    merged = list(dict.fromkeys(baseline_uids + latest_sub["pushed_message_uids"]))
+                    latest_sub["pushed_message_uids"] = merged
+                    self.save_device_subscription(latest_sub)
+
+            # Clean up obsolete seen_state.json if present
+            if self.legacy_seen_file.is_file():
+                try:
+                    self.legacy_seen_file.unlink()
+                except Exception:
+                    pass
+
+            return new_non_baseline_events
 
     def merge_with_deleted_items(
         self,

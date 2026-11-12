@@ -42,47 +42,49 @@ poll_status: dict[str, Any] = {
     "last_error": None,
     "poll_interval_seconds": POLL_INTERVAL_SECONDS,
 }
+poll_lock = asyncio.Lock()
 
 
 async def poll_once() -> dict[str, Any]:
     """Fetch latest announcements, personal notifications, and reminders and push any new items."""
-    try:
-        ann_data, personal_data, rem_data = await asyncio.gather(
-            client.get_announcements(offset=0, max_count=10),
-            client.get_personal_notifications(offset=0, max_count=10),
-            client.get_my_reminders(before_datetime=""),
-        )
-        ann_items = ann_data.get("items", [])
-        personal_items = personal_data.get("items", [])
-        rem_items = rem_data.get("items", [])
-        logger.debug(
-            "Polled %d announcements, %d personal notifications, %d reminders",
-            len(ann_items),
-            len(personal_items),
-            len(rem_items),
-        )
-        events = push_service.sync_messages(
-            announcements=ann_items,
-            personal_notifications=personal_items,
-            reminders=rem_items,
-        )
-        for ev in events:
-            logger.info("New %s recorded (%s): %s", ev["type"], ev["id"], ev["title"])
+    async with poll_lock:
+        try:
+            ann_data, personal_data, rem_data = await asyncio.gather(
+                client.get_announcements(offset=0, max_count=10),
+                client.get_personal_notifications(offset=0, max_count=10),
+                client.get_my_reminders(before_datetime=""),
+            )
+            ann_items = ann_data.get("items", [])
+            personal_items = personal_data.get("items", [])
+            rem_items = rem_data.get("items", [])
+            logger.debug(
+                "Polled %d announcements, %d personal notifications, %d reminders",
+                len(ann_items),
+                len(personal_items),
+                len(rem_items),
+            )
+            events = push_service.sync_messages(
+                announcements=ann_items,
+                personal_notifications=personal_items,
+                reminders=rem_items,
+            )
+            for ev in events:
+                logger.info("New %s recorded (%s): %s", ev["type"], ev["id"], ev["title"])
 
-        push_res = push_service.push_unpushed_messages()
-        pushed_count = push_res.get("sent", 0)
+            push_res = await asyncio.to_thread(push_service.push_unpushed_messages)
+            pushed_count = push_res.get("sent", 0)
 
-        poll_status["last_poll_at"] = datetime.now(timezone.utc).isoformat()
-        poll_status["last_error"] = None
-        return {
-            "new_events_count": len(events),
-            "pushed_count": pushed_count,
-            "events": events,
-        }
-    except Exception as exc:
-        logger.warning("Polling check failed: %s", exc)
-        poll_status["last_error"] = str(exc)
-        raise
+            poll_status["last_poll_at"] = datetime.now(timezone.utc).isoformat()
+            poll_status["last_error"] = None
+            return {
+                "new_events_count": len(events),
+                "pushed_count": pushed_count,
+                "events": events,
+            }
+        except Exception as exc:
+            logger.warning("Polling check failed: %s", exc)
+            poll_status["last_error"] = str(exc)
+            raise
 
 
 async def background_poll_loop() -> None:
@@ -260,7 +262,8 @@ async def send_test_push(payload: TestPushPayload | None = None) -> dict[str, An
             title = title or "🔔 智生活社區通知測試"
             body = body or "您的 Web Push 推播通知已正常運作！"
 
-    result = push_service.send_push_to_all(
+    result = await asyncio.to_thread(
+        push_service.send_push_to_all,
         title=title,
         body=body,
         url="/",

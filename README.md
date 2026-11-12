@@ -11,9 +11,59 @@
 4. **📲 Web Push 自動推播（依裝置獨立拆檔追蹤）**：背景定期輪詢最新社區公告、個人通知與我的提醒，將所有訊息統一記錄於 `data/messages.json`，並將每台訂閱裝置與其已推播狀態分別獨立儲存於 `data/devices/<device_id>.json`（搭配 Atomic Write 避免多裝置同時讀寫衝突），支援多裝置獨立推播、失敗重試與一鍵取消訂閱。
 
 > [!WARNING]
-> **⚠️ 免責聲明 (Disclaimer)**  
+> **⚠️  免責聲明 (Disclaimer)**  
 > 本工具僅供個人技術測試、研究與教學交流使用，與「今網智生活（智生活科技股份有限公司）」無任何官方合作或關聯。  
 > 使用本工具進行任何 API 呼叫、自動化作業所衍生之任何帳號異常、資料外洩或法律責任，開發者與貢獻者概不負任何形式之責任。請使用者確保在獲得適當授權之環境下使用，並妥善保管您的 `DEVICE_ID`（等同於長期登入憑證）。
+
+---
+
+## 🏗️ 系統架構
+
+```mermaid
+flowchart TD
+    subgraph SmartDaily["智生活雲端服務"]
+        API_Auth["Token 驗證 API (v3)"]
+        API_Ann["社區公告與附件 API (v3.24 / v3.2)"]
+        API_Notif["個人通知 API (v3.51)"]
+        API_Rem["我的提醒 API (LoadNotices)"]
+    end
+
+    subgraph Backend["smartdaily-web (FastAPI)"]
+        Client["SmartdailyClient (自動換發 10 分鐘 Token)"]
+        Poller["背景定時輪巡 (poll_once)"]
+        PushSvc["PushService (訊息比對 / 回收偵測 / Web Push)"]
+        WebUI["REST API 與 PWA 靜態前端"]
+    end
+
+    subgraph Storage["本地持久化儲存 (/app/data)"]
+        Vapid["vapid_keys.json (VAPID 公私鑰)"]
+        MsgStore["messages.json (完整訊息庫 + is_deleted 狀態)"]
+        DevFiles["devices/<device_id>.json (各裝置獨立已推播紀錄)"]
+    end
+
+    subgraph UserDevices["訂閱裝置 (iOS 16.4+ PWA / 桌面瀏覽器)"]
+        DeviceA["裝置 A (iPhone 主畫面 App)"]
+        DeviceB["裝置 B (電腦 / iPad 瀏覽器)"]
+    end
+
+    Poller -->|"定時抓取最新訊息"| Client
+    WebUI -->|"分頁查詢 / 刷新附件簽名"| Client
+    Client --> API_Auth
+    Client --> API_Ann
+    Client --> API_Notif
+    Client --> API_Rem
+
+    Poller -->|"同步新訊息與標記已回收訊息"| PushSvc
+    WebUI -->|"合併顯示已回收訊息 (is_deleted)"| PushSvc
+    PushSvc <-->|"Atomic 讀寫"| MsgStore
+    PushSvc <-->|"依裝置獨立讀寫"| DevFiles
+    PushSvc -->|"讀取金鑰"| Vapid
+
+    PushSvc -->|"Web Push (僅推播該裝置未收過的 UID)"| DeviceA
+    PushSvc -->|"Web Push (僅推播該裝置未收過的 UID)"| DeviceB
+    DeviceA <-->|"瀏覽 / 訂閱推播"| WebUI
+    DeviceB <-->|"瀏覽 / 訂閱推播"| WebUI
+```
 
 ---
 

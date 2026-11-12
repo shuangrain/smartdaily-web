@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import os
@@ -58,6 +59,7 @@ class SmartdailyClient:
         self._token_expires_mono: float = 0.0
         self._com_id: str = self._explicit_com_id
         self._community_name: str = ""
+        self._context_lock = asyncio.Lock()
 
     def resolve_device_id(self) -> str:
         """Resolve DeviceID from init arg or DEVICE_ID environment variable."""
@@ -94,36 +96,37 @@ class SmartdailyClient:
 
     async def ensure_context(self) -> tuple[str, str, str]:
         """Ensure raw_token (unexpired), com_id, and community_name are populated."""
-        if not self._raw_token or time.monotonic() >= self._token_expires_mono:
-            await self.refresh_token()
+        async with self._context_lock:
+            if not self._raw_token or time.monotonic() >= self._token_expires_mono:
+                await self.refresh_token()
 
-        if not self._com_id or not self._community_name:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(
-                    f"{SMARTDAILY_API_BASE}/Community/GetUserCommunityList",
-                    headers=self._kingnet_headers(),
-                )
-                if resp.status_code == 401:
-                    await self.refresh_token()
+            if not self._com_id or not self._community_name:
+                async with httpx.AsyncClient(timeout=15.0) as client:
                     resp = await client.get(
                         f"{SMARTDAILY_API_BASE}/Community/GetUserCommunityList",
                         headers=self._kingnet_headers(),
                     )
-                resp.raise_for_status()
-                communities = resp.json().get("Data", [])
-                if not communities:
-                    raise RuntimeError("此 DeviceID 查無綁定的社區資料")
+                    if resp.status_code == 401:
+                        await self.refresh_token()
+                        resp = await client.get(
+                            f"{SMARTDAILY_API_BASE}/Community/GetUserCommunityList",
+                            headers=self._kingnet_headers(),
+                        )
+                    resp.raise_for_status()
+                    communities = resp.json().get("Data", [])
+                    if not communities:
+                        raise RuntimeError("此 DeviceID 查無綁定的社區資料")
 
-                target = communities[0]
-                if self._com_id:
-                    for c in communities:
-                        if str(c.get("id")) == str(self._com_id):
-                            target = c
-                            break
-                self._com_id = str(target.get("id", ""))
-                self._community_name = str(target.get("community", "我的社區"))
+                    target = communities[0]
+                    if self._com_id:
+                        for c in communities:
+                            if str(c.get("id")) == str(self._com_id):
+                                target = c
+                                break
+                    self._com_id = str(target.get("id", ""))
+                    self._community_name = str(target.get("community", "我的社區"))
 
-        return self._raw_token, self._com_id, self._community_name
+            return self._raw_token, self._com_id, self._community_name
 
     def _kingnet_headers(self) -> dict[str, str]:
         return {
