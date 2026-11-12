@@ -20,48 +20,39 @@
 
 ```mermaid
 flowchart TD
-    subgraph SmartDaily["智生活雲端服務"]
-        API_Auth["Token 驗證 API (v3)"]
-        API_Ann["社區公告與附件 API (v3.24 / v3.2)"]
+    subgraph Cloud["智生活雲端 API"]
+        API_Ann["社區公告與附件 API"]
         API_Rem["我的提醒 API (LoadNotices)"]
     end
 
-    subgraph Backend["smartdaily-web (FastAPI)"]
-        Client["SmartdailyClient (自動換發 10 分鐘 Token)"]
-        Poller["背景定時輪巡 (poll_once)"]
-        PushSvc["PushService (訊息比對 / 回收偵測 / Web Push)"]
-        WebUI["REST API 與 PWA 靜態前端 (公告檢視 + 提醒分類篩選)"]
+    subgraph App["smartdaily-web (FastAPI)"]
+        Client["SmartdailyClient (自動換發 Token)"]
+        Poller["背景定時輪巡"]
+        PushSvc["PushService (訊息同步 / 回收偵測 / 推播)"]
+        WebUI["PWA 前端與 REST API (公告檢視 / 提醒分類篩選)"]
     end
 
-    subgraph Storage["本地持久化儲存 (/app/data)"]
-        Vapid["vapid_keys.json (VAPID 公私鑰)"]
-        MsgStore["messages.json (完整訊息庫 + is_deleted 狀態)"]
-        AttFiles["attachments/ann_id/ (公告 PDF 與圖片本地備份)"]
-        DevFiles["devices/device_id.json (各裝置獨立已推播紀錄)"]
+    subgraph Data["本地資料 (/app/data)"]
+        MsgStore["messages.json (完整訊息庫 + is_deleted)"]
+        AttFiles["attachments/ (公告 PDF 與圖片備份)"]
+        DevFiles["devices/ (各裝置獨立訂閱與推播紀錄)"]
     end
 
-    subgraph UserDevices["訂閱裝置 (iOS 16.4+ PWA / 桌面瀏覽器)"]
-        DeviceA["裝置 A (iPhone 主畫面 App)"]
-        DeviceB["裝置 B (電腦 / iPad 瀏覽器)"]
-    end
+    Users["訂閱裝置 (iOS PWA / 桌面瀏覽器)"]
 
-    Poller -->|"定時抓取最新公告、附件與提醒"| Client
-    WebUI -->|"分頁查詢 / 讀取本地備份附件"| Client
-    Client --> API_Auth
+    Poller --> Client
+    WebUI --> Client
     Client --> API_Ann
     Client --> API_Rem
 
-    Poller -->|"同步訊息、備份公告附件、標記已回收"| PushSvc
-    WebUI -->|"合併顯示已回收訊息"| PushSvc
-    PushSvc -->|"Atomic 讀寫"| MsgStore
-    PushSvc -->|"自動下載與讀取"| AttFiles
-    PushSvc -->|"依裝置獨立讀寫"| DevFiles
-    PushSvc -->|"讀取金鑰"| Vapid
+    Poller --> PushSvc
+    WebUI --> PushSvc
+    PushSvc --> MsgStore
+    PushSvc --> AttFiles
+    PushSvc --> DevFiles
 
-    PushSvc -->|"Web Push 推播（含類型前綴，依裝置獨立追蹤）"| DeviceA
-    PushSvc -->|"Web Push 推播（含類型前綴，依裝置獨立追蹤）"| DeviceB
-    DeviceA -->|"瀏覽 / 分類篩選 / 訂閱推播"| WebUI
-    DeviceB -->|"瀏覽 / 分類篩選 / 訂閱推播"| WebUI
+    PushSvc -->|"Web Push 推播 (含類型前綴)"| Users
+    Users -->|"瀏覽 / 篩選 / 訂閱"| WebUI
 ```
 
 ---
