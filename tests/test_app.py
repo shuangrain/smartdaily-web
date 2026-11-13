@@ -1277,9 +1277,12 @@ def test_partial_sync_with_short_page_keeps_older_reminders_active(tmp_path: Pat
     assert by_id["old"]["is_deleted"] is False
 
 
-def test_poll_once_uses_incremental_pages_until_full_sync_interval(tmp_path: Path, monkeypatch):
+def test_poll_once_uses_incremental_pages_until_full_sync_interval(
+    tmp_path: Path, monkeypatch, caplog
+):
     import asyncio
     import importlib
+    import logging
     from datetime import datetime, timedelta, timezone
 
     main_mod = importlib.import_module("smartdaily_web.main")
@@ -1287,6 +1290,7 @@ def test_poll_once_uses_incremental_pages_until_full_sync_interval(tmp_path: Pat
     monkeypatch.setattr(main_mod, "push_service", svc)
     monkeypatch.setattr(main_mod, "poll_lock", asyncio.Lock())
     monkeypatch.setattr(main_mod, "FULL_SYNC_INTERVAL_SECONDS", 86400, raising=False)
+    monkeypatch.setattr(main_mod, "POLL_INTERVAL_SECONDS", 900, raising=False)
     monkeypatch.setattr(
         main_mod,
         "poll_status",
@@ -1299,8 +1303,8 @@ def test_poll_once_uses_incremental_pages_until_full_sync_interval(tmp_path: Pat
         },
     )
 
-    last_full_sync = datetime(2026, 11, 12, tzinfo=timezone.utc)
-    current_time = [last_full_sync + timedelta(hours=23, minutes=59)]
+    last_full_sync = datetime(2026, 11, 12, 19, 21, 26, 604653, tzinfo=timezone.utc)
+    current_time = [datetime(2026, 11, 13, 1, 19, 45, 382245, tzinfo=timezone.utc)]
     monkeypatch.setattr(main_mod, "_utc_now", lambda: current_time[0], raising=False)
     svc.sync_messages(
         announcements=[
@@ -1384,7 +1388,8 @@ def test_poll_once_uses_incremental_pages_until_full_sync_interval(tmp_path: Pat
         full_result = await main_mod.poll_once()
         return incremental_result, full_result
 
-    incremental_result, full_result = asyncio.run(run_incremental_then_full_sync())
+    with caplog.at_level(logging.INFO):
+        incremental_result, full_result = asyncio.run(run_incremental_then_full_sync())
 
     assert incremental_result["new_events_count"] == 1
     assert full_result["new_events_count"] == 0
@@ -1392,6 +1397,13 @@ def test_poll_once_uses_incremental_pages_until_full_sync_interval(tmp_path: Pat
     assert reminder_cursors == ["", "", "2026-11-12T10:00:00Z"]
     assert full_sync_values == [False, True]
     assert svc.get_store_metadata()["last_full_sync_at"] == current_time[0].isoformat()
+    completed_messages = [
+        record.getMessage() for record in caplog.records if "Poll completed:" in record.getMessage()
+    ]
+    assert len(completed_messages) == 2
+    assert "next_full_sync_at=2026-11-13T19:21:26.604653+00:00" in completed_messages[0]
+    assert "next_incremental_sync_at=2026-11-13T01:34:45.382245+00:00" in completed_messages[0]
+    assert "next_full_sync_at=2026-11-14T19:21:26.604653+00:00" in completed_messages[1]
     by_uid = {message["uid"]: message for message in svc.get_messages()}
     assert by_uid["announcement:99"]["is_deleted"] is True
     assert by_uid["reminder:r-1"]["is_deleted"] is False
