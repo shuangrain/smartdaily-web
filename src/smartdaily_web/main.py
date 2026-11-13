@@ -229,17 +229,32 @@ async def poll_once() -> dict[str, Any]:
             failed_count = push_res.get("failed", 0)
             active_subs = push_res.get("active_subscribers", 0)
 
-            poll_status["last_poll_at"] = _utc_now().isoformat()
+            poll_completed_at = _utc_now()
+            poll_status["last_poll_at"] = poll_completed_at.isoformat()
             poll_status["last_error"] = None
+            full_sync_reference = (
+                sync_completed_at
+                if full_sync
+                else datetime.fromisoformat(
+                    str(metadata.get("last_full_sync_at", "")).replace("Z", "+00:00")
+                )
+            )
+            if full_sync_reference.tzinfo is None:
+                full_sync_reference = full_sync_reference.replace(tzinfo=timezone.utc)
+            next_full_sync_at = full_sync_reference + timedelta(seconds=FULL_SYNC_INTERVAL_SECONDS)
+            next_incremental_sync_at = poll_completed_at + timedelta(seconds=POLL_INTERVAL_SECONDS)
             logger.info(
                 "Poll completed: announcements=%d, reminders=%d, new_events=%d, pushed=%d, "
-                "failed=%d, active_subscribers=%d",
+                "failed=%d, active_subscribers=%d, next_full_sync_at=%s, "
+                "next_incremental_sync_at=%s",
                 len(ann_items),
                 len(rem_items),
                 len(events),
                 pushed_count,
                 failed_count,
                 active_subs,
+                next_full_sync_at.isoformat(),
+                next_incremental_sync_at.isoformat(),
             )
             return {
                 "trace_id": trace_id,

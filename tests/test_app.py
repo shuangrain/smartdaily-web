@@ -941,11 +941,16 @@ def test_poll_once_trace_id_in_logs(tmp_path: Path, monkeypatch, caplog):
     import asyncio
     import importlib
     import logging
+    from datetime import datetime, timezone
 
     main_mod = importlib.import_module("smartdaily_web.main")
 
     svc = PushService(data_dir=tmp_path)
     monkeypatch.setattr(main_mod, "push_service", svc)
+    now = datetime(2026, 11, 13, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(main_mod, "_utc_now", lambda: now)
+    monkeypatch.setattr(main_mod, "POLL_INTERVAL_SECONDS", 300)
+    monkeypatch.setattr(main_mod, "FULL_SYNC_INTERVAL_SECONDS", 3600)
 
     async def fake_get_announcements(offset: int = 0, max_count: int = 10):
         return {"items": [{"id": "201", "title": "測試公告", "content": "內容"}]}
@@ -979,7 +984,9 @@ def test_poll_once_trace_id_in_logs(tmp_path: Path, monkeypatch, caplog):
     messages = [r.getMessage() for r in poll_records]
     assert any("Poll started" in m for m in messages)
     assert any("Polled 1 announcements and 1 reminders" in m for m in messages)
-    assert any("Poll completed:" in m for m in messages)
+    completed_message = next(m for m in messages if "Poll completed:" in m)
+    assert "next_incremental_sync_at=2026-11-13T10:05:00+00:00" in completed_message
+    assert "next_full_sync_at=2026-11-13T11:00:00+00:00" in completed_message
 
 
 def test_poll_once_fetches_all_announcement_and_reminder_pages(tmp_path: Path, monkeypatch):
